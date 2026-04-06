@@ -121,7 +121,7 @@ Sign up at [voipbin.net](https://voipbin.net) and create an access key through t
 git clone https://github.com/voipbin/mcp.git
 cd mcp
 uv venv
-uv sync --extra dev
+uv pip install -e ".[dev]"
 uv run pytest tests/ -v
 ```
 

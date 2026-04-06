@@ -26,7 +26,11 @@ def format_response(data: dict) -> str:
 
 
 def validate_page_size(page_size: int) -> int:
-    """Clamp page_size to a safe range (1–100)."""
+    """Clamp page_size to a safe integer range (1–100)."""
+    try:
+        page_size = int(page_size)
+    except (TypeError, ValueError):
+        page_size = 10
     return max(1, min(page_size, 100))
 
 
