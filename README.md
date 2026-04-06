@@ -107,6 +107,10 @@ The AI uses `list_billings` to retrieve your billing history.
 
 The AI uses `create_contact` to create the contact in your account.
 
+## Security Note
+
+Your VoIPbin API key is sent as a URL query parameter (`accesskey=`) on every request. The connection uses HTTPS, so the key is encrypted in transit. However, be aware that URL parameters may be recorded in server access logs and proxy logs. Avoid sharing unredacted debug output, and rotate your key if you suspect it has been exposed.
+
 ## Getting an API Key
 
 Sign up at [voipbin.net](https://voipbin.net) and create an access key through the API or the admin console at [admin.voipbin.net](https://admin.voipbin.net).
@@ -114,10 +118,10 @@ Sign up at [voipbin.net](https://voipbin.net) and create an access key through t
 ## Development
 
 ```bash
-git clone https://github.com/voipbin/voipbin-mcp.git
-cd voipbin-mcp
+git clone https://github.com/voipbin/mcp.git
+cd mcp
 uv venv
-uv pip install -e ".[dev]"
+uv sync --extra dev
 uv run pytest tests/ -v
 ```
 

@@ -21,6 +21,9 @@ class VoIPbinAPIError(Exception):
 class VoIPbinClient:
     """Async HTTP client for the VoIPbin REST API."""
 
+    def __repr__(self) -> str:
+        return f"VoIPbinClient(base_url={self.base_url!r})"
+
     def __init__(self):
         self.api_key = os.environ.get("VOIPBIN_API_KEY")
         if not self.api_key:
