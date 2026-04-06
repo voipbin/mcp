@@ -1,5 +1,9 @@
 # VoIPbin MCP Server
 
+[![PyPI version](https://img.shields.io/pypi/v/voipbin-mcp)](https://pypi.org/project/voipbin-mcp/)
+[![Python](https://img.shields.io/pypi/pyversions/voipbin-mcp)](https://pypi.org/project/voipbin-mcp/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 An MCP (Model Context Protocol) server that enables AI assistants to interact with the VoIPbin CPaaS platform. It exposes VoIPbin's communication APIs -- calls, flows, messaging, conferencing, AI, and more -- as tools that any MCP-compatible client can use to manage and automate cloud communications.
 
 ## Installation
