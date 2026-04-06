@@ -99,7 +99,7 @@ class VoIPbinClient:
             params=self._params_with_auth(),
         )
         self._handle_error(response)
-        return response.json()
+        return response.json() if response.content else {}
 
     async def close(self):
         """Close the underlying HTTP client."""

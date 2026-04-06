@@ -114,3 +114,12 @@ class TestClientDelete:
         )
         result = await client.delete("/flows/flow-1")
         assert result == {"id": "flow-1"}
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_delete_204_no_content(self, client):
+        respx.delete("https://api.voipbin.net/v1.0/flows/flow-1").mock(
+            return_value=httpx.Response(204)
+        )
+        result = await client.delete("/flows/flow-1")
+        assert result == {}
