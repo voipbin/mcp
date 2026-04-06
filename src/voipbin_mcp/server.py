@@ -25,6 +25,15 @@ def format_response(data: dict) -> str:
     return json.dumps(data, indent=2, default=str)
 
 
+def validate_page_size(page_size: int) -> int:
+    """Clamp page_size to a safe integer range (1–100)."""
+    try:
+        page_size = int(page_size)
+    except (TypeError, ValueError):
+        page_size = 10
+    return max(1, min(page_size, 100))
+
+
 # Import tools to register them on the mcp instance
 import voipbin_mcp.tools  # noqa: E402, F401
 

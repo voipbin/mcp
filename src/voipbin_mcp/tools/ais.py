@@ -1,6 +1,6 @@
 """AI voice agent tools."""
 
-from voipbin_mcp.server import mcp, get_client, format_response
+from voipbin_mcp.server import mcp, get_client, format_response, validate_page_size
 
 
 @mcp.tool()
@@ -12,7 +12,7 @@ async def list_ais(page_size: int = 10, page_token: str = "") -> str:
         page_token: Pagination cursor from a previous response.
     """
     client = get_client()
-    params = {"page_size": page_size}
+    params = {"page_size": validate_page_size(page_size)}
     if page_token:
         params["page_token"] = page_token
     result = await client.get("/ais", params=params)
@@ -49,7 +49,8 @@ async def create_ai(
         name: AI agent name.
         detail: Description.
         engine_model: LLM model (e.g., "openai.gpt-4o-mini", "anthropic.claude-3-5-sonnet", "gemini.gemini-pro-latest").
-        engine_key: API key for the LLM provider.
+        engine_key: API key for the LLM provider. This is a sensitive credential
+            that will be sent to the VoIPbin API and may appear in the response.
         init_prompt: System prompt for the AI agent.
         tts_type: Text-to-speech provider: "google", "azure", "elevenlabs", "openai", "playht".
         tts_voice_id: Voice ID for TTS (e.g., "en-US-Standard-A" for Google).

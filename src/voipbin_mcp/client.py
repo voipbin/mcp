@@ -31,6 +31,10 @@ class VoIPbinClient:
         self.base_url = BASE_URL
         self._client = httpx.AsyncClient(timeout=30.0)
 
+    def __repr__(self) -> str:
+        base_url = getattr(self, "base_url", "<not initialised>")
+        return f"VoIPbinClient(base_url={base_url!r})"
+
     def _params_with_auth(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Add accesskey to query parameters."""
         result = dict(params) if params else {}
