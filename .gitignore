@@ -6,3 +6,10 @@ build/
 .venv/
 .env
 CLAUDE.md
+*.pem
+*.key
+*.p12
+id_rsa
+.DS_Store
+.idea/
+.vscode/
