@@ -1,6 +1,6 @@
 # voipbin/mcp 스코프 A 설계: 배포 복구 및 계약 정합성 (2026-09-28)
 
-Status: v8 (설계 리뷰 라운드 1–14 반영)
+Status: v9 (설계 리뷰 라운드 1–16 반영)
 
 선행 문서: `2026-09-28-mcp-server-audit.md` (이슈 분석, 5라운드 2연속 APPROVE 종료)
 
@@ -432,18 +432,74 @@ wheel 에 대해 요구하는 build-once 구조와 같은 모양이므로, 추�
 잡으로 올리는 것이 일관된다. 추출 직후 **`FLOOR` 가 비었으면 즉시 실패**
 시킨다.
 
-```bash
-# build 잡 (러너 기본 Python, 3.11+)
-FLOOR=$(python -c "import tomllib,re;d=tomllib.load(open('pyproject.toml','rb'));\
-print([re.search(r'>=([0-9.]+)',x).group(1) for x in d['project']['dependencies'] \
-if x.startswith('mcp')][0])")
-[ -n "$FLOOR" ] || { echo "FLOOR extraction failed"; exit 1; }
-echo "floor=$FLOOR" >> "$GITHUB_OUTPUT"
+```yaml
+# dist-smoke.yml (workflow_call 재사용 워크플로, D-I)
+on:
+  workflow_call:
+    inputs:
+      floor:   { required: true, type: string }
+      version: { required: true, type: string }
 
-# dist-smoke-floor 잡 (3.10 / 3.13 매트릭스)
-pip install "mcp==${{ needs.build.outputs.floor }}" \
-  "dist/voipbin_mcp-${VER}-py3-none-any.whl[dev]"
+jobs:
+  dist-smoke-floor:
+    strategy:
+      matrix:
+        python: ["3.10", "3.13"]     # D-P
+    steps:
+      - run: |
+          pip install "mcp==${{ inputs.floor }}" \
+            "dist/voipbin_mcp-${{ inputs.version }}-py3-none-any.whl[dev]"
+          python -c "import mcp,sys; \
+            sys.exit(0 if mcp.__version__=='${{ inputs.floor }}' else 1)"
+          pytest tests/ -q
+
+# ci.yml / publish.yml (호출 측)
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:                          # ← 이 매핑이 없으면 빈 문자열이 내려간다
+      floor:   ${{ steps.meta.outputs.floor }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/setup-python@<sha>
+        with: { python-version: "3.13" }   # tomllib 필요, 러너 기본값에 의존 금지
+      - id: meta                            # ← step id 필수
+        run: |
+          FLOOR=$(python -c "import tomllib,re;\
+d=tomllib.load(open('pyproject.toml','rb'));\
+print([re.search(r'>=([0-9.]+)',x).group(1) \
+for x in d['project']['dependencies'] if x.startswith('mcp')][0])")
+          VER=$(python -c "import tomllib;\
+print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          [ -n "$FLOOR" ] && [ -n "$VER" ] || { echo "extraction failed"; exit 1; }
+          echo "floor=$FLOOR"   >> "$GITHUB_OUTPUT"
+          echo "version=$VER"   >> "$GITHUB_OUTPUT"
+  smoke:
+    needs: build                      # ← 필수
+    uses: ./.github/workflows/dist-smoke.yml
+    with:
+      floor:   ${{ needs.build.outputs.floor }}
+      version: ${{ needs.build.outputs.version }}
 ```
+
+**배선 3요소를 모두 적는 이유 (라운드 15 BLOCKER).** v8 은
+`echo "floor=$FLOOR" >> "$GITHUB_OUTPUT"` 한 줄만 보였다. `${{ needs.build.
+outputs.floor }}` 가 해석되려면 **step `id`**, **job 레벨 `outputs:` 매핑**,
+**`needs: build`** 세 가지가 전부 필요하다. GitHub 은 없는 프로퍼티를
+**빈 문자열**로 평가하므로, `outputs:` 매핑을 빠뜨리면 v8 이 없애려던 바로 그
+`pip install "mcp=="` 가 재현된다. 더 나쁜 것은 `[ -n "$FLOOR" ]` 가드가
+**build 잡 안에 있어 이 배선 실패를 볼 수 없다**는 점이다. 옛 원인만 막는다.
+그래서 소비 측에도 **핀이 먹었는지 단언**하는 스텝을 넣는다(위 `mcp.__version__`
+비교).
+
+**`needs.build` 가 아니라 `workflow_call` 입력인 이유 (라운드 15 B2).**
+D-I 는 dist-smoke 로직을 재사용 워크플로로 뺄 것을 요구한다. 재사용 워크플로
+안에는 `build` 잡이 없으므로 `needs.build` 는 해석 불가다. 하한·버전은
+**입력으로 받는다.**
+
+**`${VER}` 는 리터럴이어야 한다.** `dist/*.whl[dev]` 형태는
+`ERROR: *.whl is not a valid wheel filename` 으로 죽는다(라운드 16 실측).
+glob 과 extras 는 함께 쓸 수 없다.
 
 (위 예시는 파생 형태를 보이기 위한 것이다. 리터럴 `mcp==1.2.0` 을 워크플로에
 박으면 `pyproject.toml` 과 어긋날 수 있다.)
@@ -732,7 +788,7 @@ free-form dict 에서 명시 파라미터로 바뀌므로 **툴 호출 계약의
 | `.github/workflows/publish.yml` | 재사용 스모크 호출, build-once-then-publish, `environment:` 게이트, 태그↔버전 검사, 액션 SHA 핀 | A-1.3, D-I |
 | `src/voipbin_mcp/client.py` | envelope 파싱 + `reason`/`request_id` 구조화 속성(`VoIPbinAPIError.__init__` 를 `(status_code, message, reason=None, request_id=None)` 로 확장, 기존 2-인자 호출 호환), **error_map 전면 재구성**, 429 + **`Retry-After` 부재 허용**, 원문 폴백 200자 절단, `VOIPBIN_API_BASE_URL`, 요청별 `Cookie` 헤더 + `VOIPBIN_AUTH_TRANSPORT` 스위치(**미인식 값은 즉시 실패**, D-P), **`import json` 섀도잉 정리**(`:3,:75,:85`) | A-2.6, A-2.7, A-5.15, D-C, D-D, D-H, D-L, D-P |
 | `src/voipbin_mcp/tools/contacts.py` | `addresses`/`tag_ids`, `source`/`external_id` 추가, **`update_contact` free-form dict → `None` sentinel 명시 파라미터 7개**(D-N), 하위 리소스 5툴(바디는 D-E 표), `addresses[].type` 을 **`tel`\|`email` 로 한정**, **`target_name` 완전 제거**(D-M1: 201 후 소실), 구 `phone_numbers`/`emails`/`fields` 를 **받아서 거부**(D-O) | A-2.4, A-2.5, D-E, D-M, D-N, D-O |
-| `src/voipbin_mcp/tools/campaigns.py` | enum 4값, 신규 4필드는 **`str\|None=None` 으로 노출** + **생략 시 캠페인이 생성되나 발신하지 않음을 docstring 에 명시**(D-O1), **`update_campaign` free-form dict → `None` sentinel 명시 파라미터 5개(`actions` 제외, `service_level` 은 `int\|None`, 타입 파라미터명은 `campaign_type`)**(D-N, D-O3), **`update_campaign_actions` 툴 신설**(D-E2), 구 `fields` 받아서 거부(D-O), 모듈 요약문 | A-3.8, A-4.11, D-E, D-E2, D-G, D-N, D-O |
+| `src/voipbin_mcp/tools/campaigns.py` | enum 4값, **`service_level` 단위를 milliseconds → percentage(0-100) 로 정정**(D-M7, 두 툴 모두), 신규 4필드는 **`str\|None=None` 으로 노출** + **생략 시 캠페인이 생성되나 발신하지 않음을 docstring 에 명시**(D-O1), **`update_campaign` free-form dict → `None` sentinel 명시 파라미터 5개(`actions` 제외, `service_level` 은 `int\|None`, 타입 파라미터명은 `campaign_type`)**(D-N, D-O3), **`update_campaign_actions` 툴 신설**(D-E2), 구 `fields` 받아서 거부(D-O), 모듈 요약문 | A-3.8, A-4.11, D-E, D-E2, D-G, D-N, D-O |
 | `src/voipbin_mcp/tools/ais.py` | `stt_type` 은 핸들러 기준 **4값**(cartesia, deepgram, elevenlabs, google — `ValidValues()` 가 `""` 를 제외한다), `engine_model` 은 값 목록이 아니라 **`<provider>.<model>` 형식 + provider 목록**(D-M3, 감사 A-3.8 의 `anthropic.*` 무효 판정 철회), write-only 서술, `parameter` 를 **`dict\|None=None` 으로 신규 노출**(D-O2) | A-3.8(개정), A-3.9, A-4.12, **D-G**, D-M3 |
 | `src/voipbin_mcp/tools/flows.py` | action type 2값, uuid 예시. `update_flow` 는 required 전체 교체로 이미 정직하므로 변경 없음(D-N sweep) | A-3.8, A-3.10, **D-G** |
 | `src/voipbin_mcp/tools/calls.py` | 주소 타입을 **`tel`\|`sip`\|`agent`\|`extension`** 로 열거(D-M4, 감사 A-3.10 의 "전체" 대체), source_type 은 미검증임을 명시 | A-3.10(개정), **D-G**, D-M4 |
@@ -799,7 +855,7 @@ docstring 반영 지원" 행은 실제 변경을 서술하지 않았다. `valida
      2026-09-28 (약 6개월). 이 PR 에 주간 잡을 넣었더라도 그 기간 중 넉 달은
      **아무 신호 없이 죽어 있었다.** 드리프트가 생기는 조용한 기간에 정확히
      실패하는 메커니즘이다.
-   - **리스크 등급과 모순된다.** §9 는 enum 드리프트를 `낮음` 으로 둔다.
+   - **리스크 등급과 모순된다.** §9 는 enum 드리프트의 **영향**을 `낮음` 으로 둔다.
      낮은 리스크에 상시 워크플로를 새로 세우는 것은 오버엔지니어링이다.
    - **구현 불가다.** 스크립트가 스펙을 어디서 읽는지 정해지지 않았다. 로컬
      monorepo 체크아웃 경로는 스케줄 런에서 존재하지 않는다.
@@ -835,7 +891,7 @@ docstring 반영 지원" 행은 실제 변경을 서술하지 않았다. `valida
 | 쿠키 전송이 일부 프록시에서 막힘 | **중간** (셀프호스팅 ingress 는 미검증) | 관리형 엔드포인트 실측 200 확인. `VOIPBIN_AUTH_TRANSPORT=query` 스위치를 **같은 릴리스에** 넣어 우회 경로를 제공(D-D). |
 | `mcp<2` 상한이 공유 venv 의 mcp 2.x 를 **다운그레이드** | **중간** | 단순 배제가 아니라 다른 MCP 서버를 깨뜨릴 수 있다. README 가 격리 설치(uvx/pipx)를 우선 안내하고 공유 venv 경고를 명시한다(D-K). |
 | **공식 문서가 서드파티 fork 를 안내 중** | **중간** | `bin-api-manager/docsdev/source/ai_overview.rst:685` 가 `https://github.com/nrjchnd/voipbin-mcp` 를 가리킨다. 공식 저장소의 0.2.0 을 내면서 문서는 남의 fork 를 권하는 상태는 일관되지 않다. **본 PR 범위 밖(다른 저장소)이므로 후속 필수 항목으로 등록한다.** |
-| enum 드리프트 재발 | **발생 가능성 높음 / 영향 낮음** (지난 12개월 `enum:` 변경 48커밋, 증상은 서버 400) | A 는 `tests/data/openapi_enums.json` 부분집합 테스트로 docstring↔스냅샷 divergence 만 잡는다. 진짜 스펙 드리프트 감지는 monorepo 훅이 필요하며 **B 로 이연**(§8-4). 상시 스케줄 잡은 60일 비활동 시 자동 비활성화되어 정작 필요한 기간에 죽으므로 채택하지 않는다. |
+| enum 드리프트 재발 | **발생 가능성 높음 / 영향 낮음** (지난 12개월 `enum:` 변경 50커밋, 증상은 서버 400) | A 는 `tests/data/openapi_enums.json` 부분집합 테스트로 docstring↔스냅샷 divergence 만 잡는다. 진짜 스펙 드리프트 감지는 monorepo 훅이 필요하며 **B 로 이연**(§8-4). 상시 스케줄 잡은 60일 비활동 시 자동 비활성화되어 정작 필요한 기간에 죽으므로 채택하지 않는다. |
 | **라이브 스모크가 운영 계정에 테스트 리소스를 남김** | 중간 | §8-6 이 실계정 POST/PUT/DELETE 를 요구한다. 생성한 리소스는 **같은 스모크 스크립트가 DELETE 로 회수**하고, 이름에 `mcp-smoke-` 접두사를 붙여 식별 가능하게 한다. 회수 실패 시 스모크를 실패로 처리한다. |
 | 버전 bump 후 릴리스가 또 깨짐 | 낮음 | D-I 의 publish 게이트 + D-B 의 양 끝 스모크(런타임 기동·하한 pytest 포함). 실패 시 D-J 의 yank 절차. |
 | `validate_page_size` 의 조용한 값 보정 유지 | 수용 | `page_size=0` → 1, 비정수 → 10 으로 조용히 바뀐다. 데이터 유실과 달리 결과가 왜곡되지 않고 도구 재호출로 복구되므로 A 에서는 docstring 명시만 한다. **의도적 수용이며 누락이 아니다.** |
@@ -1016,8 +1072,44 @@ v4 의 D-M 은 스펙 ⊋ 유효 한 방향만 다뤘다. 반대도 있고, §8-
 → `timeout: int = 3600` 으로 고치고 docstring 을 "**seconds**" 로 바꾼다.
 60 미만은 서버가 86400 으로 대체한다는 점도 적는다.
 
-**체크리스트에 다섯째 칸을 더한다: *단위·형식이 문서와 일치하나.***
-"저장되는가" 만 보면 단위 오류를 놓친다.
+**체크리스트에 다섯째 칸을 더한다: *단위·형식이 문서와 맞나.*** "저장되는가"
+만 보면 단위 오류를 놓친다.
+
+#### D-M7. 단위 칸을 실제로 sweep 했더니 두 번째가 나왔다: `service_level`
+
+**라운드 16 이 찾았다. 그리고 D-M6 의 sweep 주장이 거짓이었음이 드러났다.**
+라운드 9 의 전수 sweep 은 4계층(저장 여부)만 돌렸고, D-M6 이 다섯째 칸을
+추가한 뒤 **그 칸으로 다시 훑은 적이 없다.** `conferences.timeout` 하나를
+찾고 멈춘 것을 "단위 sweep 완료" 처럼 서술한 것은 잘못이다.
+
+`campaigns.py:54` 는 `service_level` 을 "Service level target in
+**milliseconds**" 로 문서화한다. 실제는 **백분율**이다:
+
+- `openapi.yaml:1736-1739`: "Target service level **percentage**.",
+  `example: 80`
+- `bin-campaign-manager/pkg/campaignhandler/execute.go:403`:
+  `agentCapacity := (len(agents) * serviceLevel) / 100.0`
+
+즉 `service_level=3000`(3초를 의도한 값)은 **그대로 저장되고**, 용량 계산이
+`agents * 30` 이 되어 **상담사 수의 30배까지 동시 발신**한다. 200 뒤의 조용한
+오설정이며 D-M6 과 같은 클래스다.
+
+**이 건이 특히 위험한 이유:** §7 은 이 파일을 열면서 `service_level` 의 단위를
+언급하지 않고, D-O3 항목 4 는 `service_level: int = 0` 을 "서버 기본값과
+일치" 라며 **동결**한다(값은 맞고 단위는 틀린 것을 동결). 게다가 D-N 이
+`update_campaign` 에 `service_level: int | None = None` 을 추가하므로,
+그대로 두면 **틀린 단위가 두 번째 툴로 복제된다.**
+
+→ `create_campaign`·`update_campaign` docstring 을 **"Target service level
+percentage (0-100)"** 로 고친다. D-O3 항목 4 의 동결은 **기본값 `0` 에만**
+적용되며 단위 서술에는 적용되지 않음을 명시한다.
+
+**단위 칸 전수 sweep (이번에 실제로 수행).** 툴 전체에서 단위·형식을 갖는
+필드를 기계적으로 뽑았다(`grep 'second|millisecond|percent|timeout|duration|
+delay|interval|bytes|size'`, `page_size` 제외). 결과는 **정확히 2건**이고
+**둘 다 결함이었다**: `conferences.timeout`(D-M6), `campaigns.service_level`
+(D-M7). 나머지 쓰기 필드는 단위를 갖지 않는 식별자·문자열·enum 이다.
+**단위 칸에 대한 sweep 은 이로써 완료됐다.**
 
 ### D-N. 부분 업데이트 sentinel: `None` 기본값 + 비-None 만 전송
 
@@ -1185,9 +1277,25 @@ if outdialID == uuid.Nil {
 형제 툴 불일치 중 하나를 골라야 한다. → **형제 툴과 맞춘다:**
 `update_campaign(campaign_type=...)`, `create_conference(conference_type=...)`.
 LLM 이 보는 계약은 같은 개념에 같은 이름을 써야 하고, 빌트인 섀도잉도 피한다.
-**규칙으로 적는다(목록이 아니라):** 와이어 키가 `type` 인 파라미터는 전부
-`<resource>_type` 으로 노출한다. 따라서 신규 `add_contact_address` 도
-`address_type` 이다(라운드 14 가 규칙에서 유도).
+**규칙으로 적되 범위를 좁힌다 (라운드 15 BLOCKER).** v8 은 "와이어 키가
+`type` 인 파라미터는 전부" 라고 써서 **범위가 넓었다.** 문자 그대로 적용하면
+`create_call` 의 `source_type`/`destination_type`(`calls.py:42,44`, 둘 다
+와이어 키가 `type`)이 **둘 다 `call_type` 이 되어 충돌**하고, §7 이 유지하기로
+한 역할 접두사 이름과도 모순된다. `addresses[].type`, `attachments[].
+reference_type`, flow action `type` 처럼 **툴 파라미터가 아닌** 중첩 키까지
+쓸어담는 문제도 있다.
+
+→ **범위: 바디 최상위(body-root) `type` 키에 바인딩된 최상위 툴
+파라미터에만 적용한다.** 이름은 `<resource>_type`.
+
+- 적용: `create_campaign`/`update_campaign` → `campaign_type`,
+  `create_conference` → `conference_type`,
+  `add_contact_address` → `address_type`.
+- **비적용(역할 접두사 유지):** `create_call` 의 `source_type`,
+  `destination_type`. 중첩 주소 원소의 역할을 구분하는 이름이며 바디 최상위
+  키가 아니다.
+- **비적용(파라미터 아님):** `addresses[].type`, `attachments[].
+  reference_type`, flow action `type`.
 
 **3. `create_conference.data` 노출 여부.** 스펙 required 는
 `type,name,detail,timeout,data,pre_flow_id,post_flow_id` 7개인데 D-O2 는
@@ -1234,7 +1342,7 @@ LLM 이 보는 계약은 같은 개념에 같은 이름을 써야 하고, 빌트
 D-M1(`target_name`), D-M3(`stt_type`/`engine_model`), D-M4(`create_call`),
 D-M5(`conferences`) 로 각각 처리했고, D-M 의 판정 기준을 산문에서 **4계층
 체크리스트**로 바꿨다. v3 의 질문 4·5 는 해소됐다. 4 → §8-4 에서 스케줄 잡을 **철회**하고 한계를
-정직하게 서술 + B 이연 근거(48커밋) 기록. 5 → §3 에 stopping rule 3조건을
+정직하게 서술 + B 이연 근거(50커밋) 기록. 5 → §3 에 stopping rule 3조건을
 명문화하고 "본 릴리스 신규 툴 6개로 확정, 이후 동종 결함은 B" 로 종료.)
 
 (v1 의 질문 3·4 는 해소됐다. 3 → §8-4 에서 스펙 생성 스냅샷으로 해결. 4 →
@@ -1251,9 +1359,13 @@ D-M5(`conferences`) 로 각각 처리했고, D-M 의 판정 기준을 산문에�
 2. **하한 설치 형태** — `"mcp==$FLOOR" "dist/….whl[dev]"`. 두 인자로 쪼개거나
    `[dev]` 를 떼는 diff 는 거부한다(하한 pytest 가 사라진다).
 3. **`call_tool` 반환 형상 드리프트** — 실측: 1.2.0 은 list, 1.30.0 은
-   `(content, result)` 튜플. `call_tool` 을 쓰는 테스트는 양쪽을 견뎌야 한다.
-   `inputSchema`→`input_schema` 와 같은 클래스이며, **하한 pytest 가 존재하는
-   이유가 정확히 이것**이다. 실제로 잡는지 확인한다.
+   `(content, result)` 튜플. **현재 트리에는 `call_tool` 을 쓰는 테스트가
+   0건이므로, 오늘의 하한 pytest 는 이 클래스를 아무것도 잡지 못한다.**
+   (v8 은 "하한 pytest 가 존재하는 이유가 정확히 이것" 이라고 썼으나 거짓이다.)
+   → D-O 의 거부 동작 검증에 `call_tool` 테스트가 **필요하므로**, 그 테스트를
+   추가하면서 양쪽 반환 형상을 견디게 작성한다. 그때 하한 레그가 실질을 갖는다.
+   주: `input_schema` 는 **mcp 2.x 속성**이고 핀 범위(`<2`)에는 없다.
+   1.30.0 `Tool` 의 필드는 `inputSchema` 다(실측).
 4. **핀이 먹었는지 단언** — 하한 잡은 설치된 `mcp` 가 `$FLOOR` 가 아니면
    실패. 최신 잡은 해석된 버전을 출력.
 5. **툴 개수는 grep 파생 유지** — CI·테스트에 리터럴 `58` 금지.
@@ -1272,6 +1384,18 @@ D-M5(`conferences`) 로 각각 처리했고, D-M 의 판정 기준을 산문에�
     부재 단언.
 13. **뮤테이션 확인** — 각 수정을 되돌렸을 때 새 테스트가 실제로 실패하는지.
     실패하지 않는 테스트는 커버리지가 아니다.
+14. **`VOIPBIN_AUTH_TRANSPORT` 미인식 값** — D-P 대로 **즉시 실패**하는지
+    (조용한 쿠키 폴백 금지). 허용값은 `cookie`, `query` 뿐.
+15. **`Retry-After` 부재 경로** — 429 세 사이트 중 셋째는 헤더가 없다.
+    헤더 없을 때 죽지 않는지.
+16. **CI 배선 3요소** — step `id`, job 레벨 `outputs:` 매핑, `needs:`.
+    하나라도 빠지면 빈 문자열이 내려간다. 소비 측 핀 단언 스텝도 확인.
+17. **wheel 파일명 리터럴** — `dist/*.whl[dev]` 는 glob 과 extras 를 함께 쓸
+    수 없어 실패한다. `${VER}` 보간을 유지하는지.
+18. **sdist** — `uv build` 는 sdist 도 만들고 `publish` 는 `dist/` 전체를
+    올린다. 0.1.1 도 둘 다 올라가 있으므로 sdist 도 함께 올리되, **스모크를
+    거치지 않았음**을 인지한다(A 에서 sdist 스모크는 추가하지 않는다).
+19. **`service_level` 단위** — 두 툴 모두 "percentage (0-100)" 인지(D-M7).
 
 ## 12. 리뷰 이력
 
@@ -1290,4 +1414,6 @@ D-M5(`conferences`) 로 각각 처리했고, D-M 의 판정 기준을 산문에�
 | 11 | REQUEST_CHANGES | 처방은 전부 유효하나 **근거 문장 3건이 거짓**: `EngineModelTargets` 는 19개가 아니라 **18개**(`main.go:131-150`), `POST /campaigns` 는 201 이 아니라 **200**(`server/campaigns.go:56`), `IsValidConferenceType` 는 "vendor 사본에만 존재" 가 아니라 **실소스에 정의는 있고 프로덕션 호출만 0건**. 인용 드리프트 3건. 수치 주장(52→58, 하한 1.2.0, 430 operations, ruff 26/4)은 전부 독립 재도출 일치 | 거짓 문장 3건 정정, 인용 3건 정정 |
 | 12 | REQUEST_CHANGES | **처음으로 문서를 실행해본 라운드.** BLOCKER: D-B 의 하한 설치 명령 `pip install "mcp==<floor>" dist/*.whl ".[dev]"` 가 **실행 불가**(`ResolutionImpossible` — pip 이 wheel 과 `.` 를 경쟁 배포판으로 인식). 더구나 빨간 CI 앞의 쉬운 수정이 `.[dev]` 제거이고 그러면 **하한 pytest 가 조용히 사라짐**. 시그니처 미결정 3건: `attachments` 원소 형상 미지정(라운드 4 BLOCKER 3 과 동종), 파라미터명 `type` vs `campaign_type` 충돌, `create_conference.data` 노출 여부. MINOR: 툴 개수 grep 합산 필요, 태그 게이트 `v` 접두사 | 하한 명령을 **`whl[dev]` 형태로 교정** + 틀린 수정 경고 명문화(실행 재현 포함), **D-O3 신설**(attachments 바디 표·파라미터명 통일·`data` 미노출·create 기본값 동결), grep 합산·`v` 접두사 정정 |
 | 13 | REQUEST_CHANGES | 라운드 11 정정 4건 전부 TRUE 재확인, D-O3 3건 전부 소스 일치, 하한 설치 실행 성공(`42 passed`, `list_tools()` 52). **BLOCKER: `tomllib` 은 py3.11+ stdlib 인데 D-P 가 하한 잡을 3.10 에서 돌림** → 추출 스니펫이 3.10 레그에서 `ModuleNotFoundError`, `FLOOR` 공백 → `pip install "mcp=="`. MINOR: `conference.go:84-95` 는 파일이 93줄, `enum:` 커밋 48건이 재현 안 됨(50건), D-O2 의 `type` 이름이 D-O3 와 불일치 | 추출을 **build 잡으로 이동 + job output 전달 + 공백 단언**, 인용 `84-93`, 커밋수 50 정정, `conference_type` 통일 |
-| 14 | **APPROVE** | 라운드 12 BLOCKER 재실행 종결(3.10/3.13 하한 + 최신 3경로 전부 exit 0, `42 passed`, stdio `initialize` 왕복, 구 인자 거부 동작 양 버전 확인). 시그니처 9개 전부 문서만으로 작성 가능, 미결정 0건. CI YAML 2개 + publish 게이트를 **발명 없이** 작성 가능. `tomllib` 건은 **즉시·시끄럽게 실패**하며 silent-loss 성격이 없으므로 코드 리뷰 대상. **종료 권고: 설계 루프를 닫고 구현 착수** | §12 신설(코드 리뷰 검증 의무 13항), `add_contact_address` 도 규칙에서 `address_type` 유도 |
+| 14 | **APPROVE** | 라운드 12 BLOCKER 재실행 종결(3.10/3.13 하한 + 최신 3경로 전부 exit 0, `42 passed`, stdio `initialize` 왕복, 구 인자 거부 동작 양 버전 확인). 시그니처 9개 전부 문서만으로 작성 가능, 미결정 0건. CI YAML 2개 + publish 게이트를 **발명 없이** 작성 가능. `tomllib` 건은 **즉시·시끄럽게 실패**하며 silent-loss 성격이 없으므로 코드 리뷰 대상. **종료 권고: 설계 루프를 닫고 구현 착수** | §11 신설(코드 리뷰 검증 의무), `add_contact_address` 도 규칙에서 `address_type` 유도 |
+| 15 | REQUEST_CHANGES | v8 델타 집중. **BLOCKER: CI 배선이 실행 불가** — `needs.build.outputs.floor` 해석에 step `id` + job 레벨 `outputs:` 매핑 + `needs:` 3요소가 필요한데 문서는 `$GITHUB_OUTPUT` 한 줄만 보임. GitHub 은 없는 프로퍼티를 **빈 문자열**로 평가하므로 `pip install "mcp=="` 재현. 게다가 `[ -n "$FLOOR" ]` 가드가 **build 잡 안**이라 이 실패를 못 봄. **BLOCKER: D-I 의 재사용 워크플로와 모순** — `workflow_call` 안에는 `build` 잡이 없어 `needs.build` 불가, 입력으로 받아야 함. **BLOCKER: 네이밍 규칙이 과도** — `create_call` 의 `source_type`/`destination_type` 이 둘 다 `call_type` 으로 충돌. MINOR: 리스크표 48커밋이 문서 내 50과 모순, §12 참조가 renumber 후 §11 | CI 배선을 **YAML 3요소 + 소비측 핀 단언**으로 교체, 하한·버전을 `workflow_call` 입력으로, 네이밍 규칙을 **바디 최상위 `type` 키**로 범위 축소 + 비적용 목록 명시, 48→50 정정, 참조 정정 |
+| 16 | REQUEST_CHANGES | CI 전체를 YAML 로 작성·실행 성공(3.10/3.13 하한 `42 passed`, `list_tools()` 52, stdio 왕복, `uvx` 양단). **BLOCKER: 여섯 번째 인스턴스 — `create_campaign.service_level` 이 "milliseconds" 로 문서화됐으나 실제는 백분율**(`openapi.yaml:1738` "percentage", `execute.go:403` `(len(agents)*serviceLevel)/100.0`). **D-M6 의 단위 칸이 실제로는 한 번도 sweep 되지 않았음**이 드러남. D-N 이 `update_campaign` 으로 틀린 단위를 복제할 참이었음. MAJOR: §11 항목 3 이 거짓(`call_tool` 테스트 0건이라 하한 pytest 가 이 클래스를 못 잡음), `input_schema` 는 2.x 속성이라 핀 범위에 없음. MINOR: sdist 미결정, `dist/*.whl[dev]` glob 실패, §11 에 `AUTH_TRANSPORT`·`Retry-After` 항목 없음 | **D-M7 신설** + **단위 칸 전수 sweep 실제 수행**(단위 보유 필드 정확히 2건, 둘 다 결함이었음, 이로써 완료), §11 항목 3 정정 + 항목 14~19 추가(sdist 결정 포함), `${VER}` 리터럴 필수 명시 |
