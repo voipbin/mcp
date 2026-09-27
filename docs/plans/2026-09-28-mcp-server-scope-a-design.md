@@ -1,6 +1,6 @@
 # voipbin/mcp 스코프 A 설계: 배포 복구 및 계약 정합성 (2026-09-28)
 
-Status: v7 (설계 리뷰 라운드 1–12 반영)
+Status: v8 (설계 리뷰 라운드 1–14 반영)
 
 선행 문서: `2026-09-28-mcp-server-audit.md` (이슈 분석, 5라운드 2연속 APPROVE 종료)
 
@@ -415,13 +415,34 @@ pip install "mcp==${FLOOR}" "dist/voipbin_mcp-${VER}-py3-none-any.whl[dev]"
 
 하한 값은 `pyproject.toml` 의 하한과 한 곳에서 파생되어야 한다. CI 가 별도
 상수를 들고 있으면 둘이 어긋난다. 워크플로에서 `pyproject.toml` 을 파싱해
-하한을 추출하는 스텝을 둔다(단일 write-through). 예:
+하한을 추출한다(단일 write-through).
+
+**추출 스텝은 반드시 `build` 잡에서 돌리고 결과를 job output 으로 넘긴다
+(라운드 13·14 가 독립적으로 찾은 BLOCKER).** `tomllib` 은 **Python 3.11
+부터 stdlib** 인데, D-P 는 `dist-smoke-floor` 를 **3.10** 에서도 돌리도록
+정한다. 추출 스니펫을 3.10 매트릭스 레그 안에 두면 죽는다:
+
+```
+python3.10 -c "import tomllib" → ModuleNotFoundError: No module named 'tomllib'
+python3.11/3.12/3.13          → OK
+```
+
+`FLOOR` 가 빈 문자열이 되어 `pip install "mcp=="` 로 이어진다. 이미 D-I 가
+wheel 에 대해 요구하는 build-once 구조와 같은 모양이므로, 추출도 `build`
+잡으로 올리는 것이 일관된다. 추출 직후 **`FLOOR` 가 비었으면 즉시 실패**
+시킨다.
 
 ```bash
+# build 잡 (러너 기본 Python, 3.11+)
 FLOOR=$(python -c "import tomllib,re;d=tomllib.load(open('pyproject.toml','rb'));\
 print([re.search(r'>=([0-9.]+)',x).group(1) for x in d['project']['dependencies'] \
 if x.startswith('mcp')][0])")
-pip install "mcp==${FLOOR}" "dist/voipbin_mcp-${VER}-py3-none-any.whl[dev]"
+[ -n "$FLOOR" ] || { echo "FLOOR extraction failed"; exit 1; }
+echo "floor=$FLOOR" >> "$GITHUB_OUTPUT"
+
+# dist-smoke-floor 잡 (3.10 / 3.13 매트릭스)
+pip install "mcp==${{ needs.build.outputs.floor }}" \
+  "dist/voipbin_mcp-${VER}-py3-none-any.whl[dev]"
 ```
 
 (위 예시는 파생 형태를 보이기 위한 것이다. 리터럴 `mcp==1.2.0` 을 워크플로에
@@ -791,7 +812,7 @@ docstring 반영 지원" 행은 실제 변경을 서술하지 않았다. `valida
    **정직한 한계 서술:** 이 구성은 **docstring ↔ 스냅샷 divergence 만** 잡는다.
    진짜 스펙 드리프트 감지는 monorepo 쪽 훅이 필요하며 **B 로 이연**한다.
    B 의 근거가 될 실측 트리거를 기록해 둔다: 지난 12개월간
-   `bin-openapi-manager/openapi/openapi.yaml` 의 `enum:` 변경 커밋 **48건**.
+   `bin-openapi-manager/openapi/openapi.yaml` 의 `enum:` 변경 커밋 **50건**.
    드리프트 발생 가능성은 사실상 확실하고, 영향은 서버 400 이므로 낮다.
 
    스냅샷 생성 스크립트의 스펙 입력은 **`voipbin/monorepo` raw URL 을 ref 로
@@ -964,7 +985,7 @@ v4 의 D-M 은 스펙 ⊋ 유효 한 방향만 다뤘다. 반대도 있고, §8-
 #### D-M5. `conferences.py` 의 `type` 하드코딩 해제
 
 §7 이 하드코딩 해제를 지시하면서 값 집합을 정하지 않았다. `conference.Type`
-은 **어느 계층에서도 검증되지 않는다**(`IsValidConferenceType` 는 정의는 존재하나(`models/conference/conference.go:84-95`) **프로덕션 호출 0건**이고 `type_test.go:64,66` 만 호출). 임의 문자열이 저장된다. 그리고
+은 **어느 계층에서도 검증되지 않는다**(`IsValidConferenceType` 는 정의는 존재하나(`models/conference/conference.go:84-93`) **프로덕션 호출 0건**이고 `type_test.go:64,66` 만 호출). 임의 문자열이 저장된다. 그리고
 `conferencehandler/conference.go:71-74` 는 `conference` 가 아닌 모든 값을
 `TypeConnect` confbridge 로 매핑한다.
 
@@ -1136,7 +1157,7 @@ if outdialID == uuid.Nil {
 
 → **새로 노출하는 필드는 전부 기본값을 주고 `None` 이면 생략한다.**
 `parameter: dict | None = None`, `attachments: list[dict] | None = None`,
-`type: str = "conference"`(현재 하드코딩 값을 기본값으로 보존).
+`conference_type: str = "conference"`(현재 하드코딩 값을 기본값으로 보존, 이름은 D-O3).
 스펙상 required 라는 사실은 docstring 에 적는다.
 
 #### D-O3. 구현자가 여전히 결정해야 했던 3건 (라운드 12)
@@ -1164,6 +1185,9 @@ if outdialID == uuid.Nil {
 형제 툴 불일치 중 하나를 골라야 한다. → **형제 툴과 맞춘다:**
 `update_campaign(campaign_type=...)`, `create_conference(conference_type=...)`.
 LLM 이 보는 계약은 같은 개념에 같은 이름을 써야 하고, 빌트인 섀도잉도 피한다.
+**규칙으로 적는다(목록이 아니라):** 와이어 키가 `type` 인 파라미터는 전부
+`<resource>_type` 으로 노출한다. 따라서 신규 `add_contact_address` 도
+`address_type` 이다(라운드 14 가 규칙에서 유도).
 
 **3. `create_conference.data` 노출 여부.** 스펙 required 는
 `type,name,detail,timeout,data,pre_flow_id,post_flow_id` 7개인데 D-O2 는
@@ -1216,7 +1240,40 @@ D-M5(`conferences`) 로 각각 처리했고, D-M 의 판정 기준을 산문에�
 (v1 의 질문 3·4 는 해소됐다. 3 → §8-4 에서 스펙 생성 스냅샷으로 해결. 4 →
 감사 §9-A item 5 가 이미 명령한 항목이므로 스코프 위반이 아니다.)
 
-## 11. 리뷰 이력
+
+## 11. 구현자가 코드 리뷰로 가져갈 검증 의무
+
+설계 리뷰는 여기서 닫지만, 아래는 **코드 리뷰에서 반드시 확인**한다. 라운드
+13·14 가 실행으로 확인했거나 실행 중에만 드러나는 항목들이다.
+
+1. **`tomllib` 배치** — 하한/버전 추출은 py ≥ 3.11(빌드 잡)에서만. 3.10
+   매트릭스 레그 안에 두지 않는다. 추출 후 `FLOOR` 비었는지 단언.
+2. **하한 설치 형태** — `"mcp==$FLOOR" "dist/….whl[dev]"`. 두 인자로 쪼개거나
+   `[dev]` 를 떼는 diff 는 거부한다(하한 pytest 가 사라진다).
+3. **`call_tool` 반환 형상 드리프트** — 실측: 1.2.0 은 list, 1.30.0 은
+   `(content, result)` 튜플. `call_tool` 을 쓰는 테스트는 양쪽을 견뎌야 한다.
+   `inputSchema`→`input_schema` 와 같은 클래스이며, **하한 pytest 가 존재하는
+   이유가 정확히 이것**이다. 실제로 잡는지 확인한다.
+4. **핀이 먹었는지 단언** — 하한 잡은 설치된 `mcp` 가 `$FLOOR` 가 아니면
+   실패. 최신 잡은 해석된 버전을 출력.
+5. **툴 개수는 grep 파생 유지** — CI·테스트에 리터럴 `58` 금지.
+   `grep -h … | wc -l` (파일별 `-c` 아님).
+6. **태그 게이트 `v` 제거** — `v0.2.0` 과 불일치 태그 양쪽 테스트.
+7. **build-once** — `publish.yml` 이 다운로드한 아티팩트를 올리는지, 스모크
+   게이트 뒤에 재빌드가 없는지.
+8. **stdio 스모크는 내용을 단언** — `"result"` 존재 + `Traceback` 부재.
+   타임아웃 exit 0 만으로는 아무것도 증명하지 못한다.
+9. **D-N sentinel** — 바디에서 `None` 파라미터가 생략되고 `""` 는 전송되는지.
+   `service_level=0` 을 명시적으로 커버.
+10. **D-O 거부** — 구 파라미터에 값이 오면 raise 하고 **서버로 아무것도 보내지
+    않는지**. 구 파라미터 부재는 무동작.
+11. **D-M6 단위** — `timeout` 기본값 `3600`, docstring 이 seconds.
+12. **전 verb 인증** — POST/PUT/DELETE 에도 Cookie 단언 + URL 에 accesskey
+    부재 단언.
+13. **뮤테이션 확인** — 각 수정을 되돌렸을 때 새 테스트가 실제로 실패하는지.
+    실패하지 않는 테스트는 커버리지가 아니다.
+
+## 12. 리뷰 이력
 
 | 회차 | 판정 | 핵심 피드백 | 조치 |
 |---|---|---|---|
@@ -1232,3 +1289,5 @@ D-M5(`conferences`) 로 각각 처리했고, D-M 의 판정 기준을 산문에�
 | 10 | **APPROVE** | 라운드 8 요구 3건 전부 substance 충족 확인(pydantic 동작 독립 재현, `outgoing_call.go`/`groupcallhandler` 로 주소집합 확인). 스코프 A 는 여전히 올바르게 경계지어짐(라운드 7~10 은 표면을 **좁히기만** 했음). 오버엔지니어링 없음(스케줄 잡 철회, 잔존 항목 전부 실측 트리거 보유). **리뷰 churn 리스크가 미발견 결함 리스크를 상회**하므로 구현 착수 권고. 단 D-O1 의 "hard-fail 0건" 이 새로 노출되는 3개 required 필드에는 미적용 | **D-O2 신설**(신규 노출 required 필드도 기본값 + 생략) |
 | 11 | REQUEST_CHANGES | 처방은 전부 유효하나 **근거 문장 3건이 거짓**: `EngineModelTargets` 는 19개가 아니라 **18개**(`main.go:131-150`), `POST /campaigns` 는 201 이 아니라 **200**(`server/campaigns.go:56`), `IsValidConferenceType` 는 "vendor 사본에만 존재" 가 아니라 **실소스에 정의는 있고 프로덕션 호출만 0건**. 인용 드리프트 3건. 수치 주장(52→58, 하한 1.2.0, 430 operations, ruff 26/4)은 전부 독립 재도출 일치 | 거짓 문장 3건 정정, 인용 3건 정정 |
 | 12 | REQUEST_CHANGES | **처음으로 문서를 실행해본 라운드.** BLOCKER: D-B 의 하한 설치 명령 `pip install "mcp==<floor>" dist/*.whl ".[dev]"` 가 **실행 불가**(`ResolutionImpossible` — pip 이 wheel 과 `.` 를 경쟁 배포판으로 인식). 더구나 빨간 CI 앞의 쉬운 수정이 `.[dev]` 제거이고 그러면 **하한 pytest 가 조용히 사라짐**. 시그니처 미결정 3건: `attachments` 원소 형상 미지정(라운드 4 BLOCKER 3 과 동종), 파라미터명 `type` vs `campaign_type` 충돌, `create_conference.data` 노출 여부. MINOR: 툴 개수 grep 합산 필요, 태그 게이트 `v` 접두사 | 하한 명령을 **`whl[dev]` 형태로 교정** + 틀린 수정 경고 명문화(실행 재현 포함), **D-O3 신설**(attachments 바디 표·파라미터명 통일·`data` 미노출·create 기본값 동결), grep 합산·`v` 접두사 정정 |
+| 13 | REQUEST_CHANGES | 라운드 11 정정 4건 전부 TRUE 재확인, D-O3 3건 전부 소스 일치, 하한 설치 실행 성공(`42 passed`, `list_tools()` 52). **BLOCKER: `tomllib` 은 py3.11+ stdlib 인데 D-P 가 하한 잡을 3.10 에서 돌림** → 추출 스니펫이 3.10 레그에서 `ModuleNotFoundError`, `FLOOR` 공백 → `pip install "mcp=="`. MINOR: `conference.go:84-95` 는 파일이 93줄, `enum:` 커밋 48건이 재현 안 됨(50건), D-O2 의 `type` 이름이 D-O3 와 불일치 | 추출을 **build 잡으로 이동 + job output 전달 + 공백 단언**, 인용 `84-93`, 커밋수 50 정정, `conference_type` 통일 |
+| 14 | **APPROVE** | 라운드 12 BLOCKER 재실행 종결(3.10/3.13 하한 + 최신 3경로 전부 exit 0, `42 passed`, stdio `initialize` 왕복, 구 인자 거부 동작 양 버전 확인). 시그니처 9개 전부 문서만으로 작성 가능, 미결정 0건. CI YAML 2개 + publish 게이트를 **발명 없이** 작성 가능. `tomllib` 건은 **즉시·시끄럽게 실패**하며 silent-loss 성격이 없으므로 코드 리뷰 대상. **종료 권고: 설계 루프를 닫고 구현 착수** | §12 신설(코드 리뷰 검증 의무 13항), `add_contact_address` 도 규칙에서 `address_type` 유도 |
