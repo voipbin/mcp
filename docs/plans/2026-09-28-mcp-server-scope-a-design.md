@@ -1,6 +1,6 @@
 # voipbin/mcp 스코프 A 설계: 배포 복구 및 계약 정합성 (2026-09-28)
 
-Status: v6 (설계 리뷰 라운드 1–10 반영)
+Status: v7 (설계 리뷰 라운드 1–12 반영)
 
 선행 문서: `2026-09-28-mcp-server-audit.md` (이슈 분석, 5라운드 2연속 APPROVE 종료)
 
@@ -379,8 +379,32 @@ run 호출이며 §5.1 에서 확인한 대로 `transport` 리터럴이 핀 범�
 **하한에서 pytest 를 돌린다 (같은 finding).** `test` 잡은 `uv.lock` 의 단일
 mcp 버전만 본다. §5.1 이 기록한 `inputSchema` → `input_schema` 속성 개명은
 **테스트 코드에만 보이는** 종류의 드리프트이고, import 스모크로는 절대 잡히지
-않는다. `dist-smoke-floor` 에서 `pip install "mcp==<floor>" dist/*.whl ".[dev]"`
-후 pytest 를 실행한다.
+않는다. `dist-smoke-floor` 에서 pytest 를 실행한다.
+
+**명령 형태가 중요하다 (리뷰 라운드 12 BLOCKER, 실행으로 재현).** wheel 과
+`.[dev]` 를 **별개 인자로 주면 실패한다.** pip 이 둘을 같은 프로젝트의 경쟁
+배포판으로 보기 때문이다:
+
+```
+$ pip install "mcp==1.2.0" dist/*.whl ".[dev]"
+ERROR: Cannot install voipbin-mcp 0.1.1 (from .) and voipbin-mcp 0.1.1
+(from dist/voipbin_mcp-0.1.1-py3-none-any.whl) because these package versions
+have conflicting dependencies.
+ERROR: ResolutionImpossible
+```
+
+→ **extras 를 wheel 에 붙인다:**
+
+```bash
+pip install "mcp==${FLOOR}" "dist/voipbin_mcp-${VER}-py3-none-any.whl[dev]"
+```
+
+이 형태는 실제로 성공하고 `42 passed` 까지 확인했다.
+
+**이 문단을 지우면 안 되는 이유:** 빨간 CI 앞에서 구현자가 손대기 쉬운 수정은
+`.[dev]` 를 **빼는 것**이고, 그러면 pytest 의존성이 사라져 **하한 pytest 가
+조용히 사라진다.** 그것은 라운드 3 이 MAJOR 로 제기해 이 잡을 만들게 한 바로
+그 구멍이다. 틀린 수정이 더 쉬운 지점이므로 옳은 형태를 명시한다.
 
 `uv run` 은 쓰지 않는다. 그게 문제의 원인이었다. 순수 `python -m venv` +
 `pip install` 로 간다.
@@ -397,7 +421,7 @@ mcp 버전만 본다. §5.1 이 기록한 `inputSchema` → `input_schema` 속�
 FLOOR=$(python -c "import tomllib,re;d=tomllib.load(open('pyproject.toml','rb'));\
 print([re.search(r'>=([0-9.]+)',x).group(1) for x in d['project']['dependencies'] \
 if x.startswith('mcp')][0])")
-pip install "mcp==${FLOOR}" dist/*.whl
+pip install "mcp==${FLOOR}" "dist/voipbin_mcp-${VER}-py3-none-any.whl[dev]"
 ```
 
 (위 예시는 파생 형태를 보이기 위한 것이다. 리터럴 `mcp==1.2.0` 을 워크플로에
@@ -650,6 +674,9 @@ accurately rather than as a missing feature.
   지점을 만든다.
 - **태그 ↔ 버전 일치 검사**: 릴리스 태그와 `pyproject.toml:3` 의 `version` 이
   다르면 실패시킨다. PyPI 파일은 불변이므로 잘못 올리면 버전을 태워야 한다.
+  **비교 전에 `v` 접두사를 벗긴다.** 기존 태그는 `v0.1.0`, `v0.1.1` 이고
+  `version` 은 `0.1.1` 이므로, 그대로 비교하면 게이트가 **항상 실패**한다
+  (라운드 12).
 - 액션은 commit SHA 로 핀한다.
 
 ### D-J. 버전 번호와 롤백 절차
@@ -684,12 +711,12 @@ free-form dict 에서 명시 파라미터로 바뀌므로 **툴 호출 계약의
 | `.github/workflows/publish.yml` | 재사용 스모크 호출, build-once-then-publish, `environment:` 게이트, 태그↔버전 검사, 액션 SHA 핀 | A-1.3, D-I |
 | `src/voipbin_mcp/client.py` | envelope 파싱 + `reason`/`request_id` 구조화 속성(`VoIPbinAPIError.__init__` 를 `(status_code, message, reason=None, request_id=None)` 로 확장, 기존 2-인자 호출 호환), **error_map 전면 재구성**, 429 + **`Retry-After` 부재 허용**, 원문 폴백 200자 절단, `VOIPBIN_API_BASE_URL`, 요청별 `Cookie` 헤더 + `VOIPBIN_AUTH_TRANSPORT` 스위치(**미인식 값은 즉시 실패**, D-P), **`import json` 섀도잉 정리**(`:3,:75,:85`) | A-2.6, A-2.7, A-5.15, D-C, D-D, D-H, D-L, D-P |
 | `src/voipbin_mcp/tools/contacts.py` | `addresses`/`tag_ids`, `source`/`external_id` 추가, **`update_contact` free-form dict → `None` sentinel 명시 파라미터 7개**(D-N), 하위 리소스 5툴(바디는 D-E 표), `addresses[].type` 을 **`tel`\|`email` 로 한정**, **`target_name` 완전 제거**(D-M1: 201 후 소실), 구 `phone_numbers`/`emails`/`fields` 를 **받아서 거부**(D-O) | A-2.4, A-2.5, D-E, D-M, D-N, D-O |
-| `src/voipbin_mcp/tools/campaigns.py` | enum 4값, 신규 4필드는 **`str\|None=None` 으로 노출** + **생략 시 캠페인이 생성되나 발신하지 않음을 docstring 에 명시**(D-O1), **`update_campaign` free-form dict → `None` sentinel 명시 파라미터 5개(`actions` 제외, `service_level` 은 `int\|None`)**(D-N), **`update_campaign_actions` 툴 신설**(D-E2), 구 `fields` 받아서 거부(D-O), 모듈 요약문 | A-3.8, A-4.11, D-E, D-E2, D-G, D-N, D-O |
+| `src/voipbin_mcp/tools/campaigns.py` | enum 4값, 신규 4필드는 **`str\|None=None` 으로 노출** + **생략 시 캠페인이 생성되나 발신하지 않음을 docstring 에 명시**(D-O1), **`update_campaign` free-form dict → `None` sentinel 명시 파라미터 5개(`actions` 제외, `service_level` 은 `int\|None`, 타입 파라미터명은 `campaign_type`)**(D-N, D-O3), **`update_campaign_actions` 툴 신설**(D-E2), 구 `fields` 받아서 거부(D-O), 모듈 요약문 | A-3.8, A-4.11, D-E, D-E2, D-G, D-N, D-O |
 | `src/voipbin_mcp/tools/ais.py` | `stt_type` 은 핸들러 기준 **4값**(cartesia, deepgram, elevenlabs, google — `ValidValues()` 가 `""` 를 제외한다), `engine_model` 은 값 목록이 아니라 **`<provider>.<model>` 형식 + provider 목록**(D-M3, 감사 A-3.8 의 `anthropic.*` 무효 판정 철회), write-only 서술, `parameter` 를 **`dict\|None=None` 으로 신규 노출**(D-O2) | A-3.8(개정), A-3.9, A-4.12, **D-G**, D-M3 |
 | `src/voipbin_mcp/tools/flows.py` | action type 2값, uuid 예시. `update_flow` 는 required 전체 교체로 이미 정직하므로 변경 없음(D-N sweep) | A-3.8, A-3.10, **D-G** |
 | `src/voipbin_mcp/tools/calls.py` | 주소 타입을 **`tel`\|`sip`\|`agent`\|`extension`** 로 열거(D-M4, 감사 A-3.10 의 "전체" 대체), source_type 은 미검증임을 명시 | A-3.10(개정), **D-G**, D-M4 |
-| `src/voipbin_mcp/tools/emails.py` | `attachments` 를 **`list[dict]\|None=None` 으로 신규 노출**(D-O2) | A-4.13, D-G, D-O2 |
-| `src/voipbin_mcp/tools/conferences.py` | required 전체, `type` 하드코딩 해제 → **`conference`\|`connect`**(기본값 `"conference"` 보존, D-O2), `queue` 는 `connect` 로 정규화됨 + 서버 검증 없음을 명시(D-M5), **`timeout` 을 3600000ms → 3600s 로 정정**(D-M6) | A-4.13, D-M5, D-M6, D-O2 |
+| `src/voipbin_mcp/tools/emails.py` | `attachments` 를 **`list[dict]\|None=None` 으로 신규 노출**(D-O2), 원소는 **`reference_type`(`""`\|`recording`) + `reference_id`(uuid)** 2필드(D-O3) | A-4.13, D-G, D-O2, D-O3 |
+| `src/voipbin_mcp/tools/conferences.py` | required 전체, `type` 하드코딩 해제 → **`conference`\|`connect`**(기본값 `"conference"` 보존, D-O2), `queue` 는 `connect` 로 정규화됨 + 서버 검증 없음을 명시(D-M5), **`timeout` 을 3600000ms → 3600s 로 정정**(D-M6), 파라미터명 `conference_type`, `data` 는 하드코딩 `{}` 유지(D-O3) | A-4.13, D-M5, D-M6, D-O2 |
 | `src/voipbin_mcp/tools/routes.py` | **"accesskey 로 사용 불가" 명시** (superadmin 전용 아님, §5.4b) | A-5.14, D-F |
 | 모든 list 툴 | page_size 1–100 명시 | A-3.10, **D-G** |
 | `tests/test_client.py` | **기존 픽스처 교정**: envelope 중첩 형태로 교체(`:62,71,91`), **accesskey URL 단언 재작성**(`:45,:56` → Cookie 헤더 존재 + URL 에 accesskey **부재**), **POST/PUT/DELETE 테스트(`:80,:100,:111`)에도 인증 단언 추가**(공유 헬퍼 `client.py:79,89,99`), base URL 기본값 단언(`:21-22`) 유지 + 환경변수 오버라이드 추가, 429(`Retry-After` 유/무 both) 테스트, `import os` 미사용 정리(`:1`) | A-2.6, A-5.15, A-5.16, D-D, D-L |
@@ -716,7 +743,7 @@ docstring 반영 지원" 행은 실제 변경을 서술하지 않았다. `valida
 
      **개수는 한 곳에서만 권위를 갖는다.** 설계 문서와 CI 양쪽에 숫자를 박으면
      어긋난다(설계가 mcp 하한에 대해 지적한 것과 같은 문제). CI 는 리터럴을
-     쓰지 않고 `grep -c '@mcp.tool()' src/voipbin_mcp/tools/*.py` 로 기대값을
+     쓰지 않고 `grep -h '@mcp.tool()' src/voipbin_mcp/tools/*.py | wc -l` (파일별 `-c` 는 파일마다 한 줄씩 내므로 합산이 필요하다) 로 기대값을
      파생해 `list_tools()` 결과와 비교한다. 즉 검사는 "소스에 선언된 툴이
      빠짐없이 등록되는가" 이며, 숫자 자체는 아무 곳에도 하드코딩되지 않는다.
    - 콘솔 스크립트 entry point 가 해석되는지
@@ -904,15 +931,15 @@ if addrType != "tel" && addrType != "email" {
 v4 의 D-M 은 스펙 ⊋ 유효 한 방향만 다뤘다. 반대도 있고, §8-4 의 부분집합
 테스트가 **틀린 답을 강제**한다.
 
-- **`stt_type`**: 스펙 enum 은 4값(`openapi.yaml:2955-2962`: `""`, cartesia,
+- **`stt_type`**: 스펙 enum 은 4값(`openapi.yaml:2960-2963`: `""`, cartesia,
   deepgram, elevenlabs)인데 핸들러는 **`google` 을 추가로 받는다**
-  (`bin-ai-manager/models/ai/main.go:310-320` `validSTTTypes`,
+  (`bin-ai-manager/models/ai/main.go:317-321` `validSTTTypes`,
   `aihandler/chatbot.go:60` 에서 실제 호출). D-M 규칙상 `google` 은 광고
   대상인데 부분집합 테스트는 이를 탈락시킨다. → **스냅샷 집합은 스펙이 아니라
   핸들러의 `validSTTTypes` 에서 뽑는다.**
 - **`engine_model`**: 검증이 **prefix 기반**이다
-  (`ai/main.go:205-218` `IsValidEngineModel` 는 `.` 앞부분이 19개
-  `EngineModelTargets` 중 하나면 통과, `chatbot.go:41,119` 에서 호출). 따라서
+  (`ai/main.go:205-218` `IsValidEngineModel` 는 `.` 앞부분이 **18개**
+  `EngineModelTargets`(`ai/main.go:131-150`) 중 하나면 통과, `chatbot.go:41,119` 에서 호출). 따라서
   `ais.py:51` 의 `anthropic.claude-3-5-sonnet` 은 **유효하다**(`anthropic` 은
   target 목록에 있음). 스펙의 11값 enum 은 권위가 아니다.
   **감사 §A-3.8 이 이 값을 무효로 판정한 것은 틀렸으며 여기서 철회한다.**
@@ -937,9 +964,8 @@ v4 의 D-M 은 스펙 ⊋ 유효 한 방향만 다뤘다. 반대도 있고, §8-
 #### D-M5. `conferences.py` 의 `type` 하드코딩 해제
 
 §7 이 하드코딩 해제를 지시하면서 값 집합을 정하지 않았다. `conference.Type`
-은 **어느 계층에서도 검증되지 않는다**(`IsValidConferenceType` 는 vendor
-사본에만 존재하고 실제 호출 0건). 임의 문자열이 저장된다. 그리고
-`conferencehandler/conference.go:70-73` 은 `conference` 가 아닌 모든 값을
+은 **어느 계층에서도 검증되지 않는다**(`IsValidConferenceType` 는 정의는 존재하나(`models/conference/conference.go:84-95`) **프로덕션 호출 0건**이고 `type_test.go:64,66` 만 호출). 임의 문자열이 저장된다. 그리고
+`conferencehandler/conference.go:71-74` 는 `conference` 가 아닌 모든 값을
 `TypeConnect` confbridge 로 매핑한다.
 
 → 저장은 되므로 D-M 불변식을 통과하지만, **`queue` 는 저장만 될 뿐 동작은
@@ -1087,7 +1113,7 @@ if outdialID == uuid.Nil {
 게이트웨이는 `PostCampaignsJSONBody` 의 **비포인터 `string`**
 (`gen.go:8626-8635`)에 `uuid.FromStringOrNil` 을 적용하므로, 생략 → `""` →
 `uuid.Nil` → **전 검증 건너뜀**이다. 결과는 outplan·outdial·queue 가 없는
-캠페인이 **201 로 생성되고 영원히 발신하지 않는 것**이다. 성공 응답 뒤의
+캠페인이 **200 으로 생성되고 영원히 발신하지 않는 것**이다(`server/campaigns.go:56` 은 `c.JSON(200, res)`). 성공 응답 뒤의
 조용히 잘못 구성된 리소스이며, §1 과 D-O 가 없애려는 바로 그 클래스다.
 
 처방은 그대로 유지한다(hard-fail 논거는 여전히 유효). 대신 **docstring 이
@@ -1112,6 +1138,45 @@ if outdialID == uuid.Nil {
 `parameter: dict | None = None`, `attachments: list[dict] | None = None`,
 `type: str = "conference"`(현재 하드코딩 값을 기본값으로 보존).
 스펙상 required 라는 사실은 docstring 에 적는다.
+
+#### D-O3. 구현자가 여전히 결정해야 했던 3건 (라운드 12)
+
+라운드 12 가 문서만 보고 실제 시그니처를 작성해본 결과, 세 곳에서 멈춰야
+했다. 여기서 확정한다.
+
+**1. `send_email(attachments=...)` 원소 형상.** v6 는 `list[dict]|None=None`
+이라고만 적고 dict 안을 정하지 않았다. **이것은 라운드 4 BLOCKER 3 과 같은
+클래스다** — D-E 가 contacts 하위 리소스에 바디 표를 붙인 이유가 정확히
+"구현자가 원소 내용을 추측하게 두지 않는 것" 이었는데, `attachments` 에는
+그 표가 없었다. Go 실측:
+
+| 필드 | 타입 | 출처 |
+|---|---|---|
+| `reference_type` | `""` \| `"recording"` | `bin-email-manager/models/email/main.go:67-72` |
+| `reference_id` | uuid | `main.go:46-49` |
+
+게이트웨이가 둘 다 읽는다(`server/emails.go:41-44`
+`ConvertEmailMamagerEmailAttachment`). D-M 4계층 통과. docstring 에 이 표를
+그대로 쓴다.
+
+**2. 파라미터 이름 충돌.** `create_campaign` 은 같은 wire 필드를
+`campaign_type` 으로 부르는데 D-E2 는 `type` 으로 적었다. 빌트인 섀도잉과
+형제 툴 불일치 중 하나를 골라야 한다. → **형제 툴과 맞춘다:**
+`update_campaign(campaign_type=...)`, `create_conference(conference_type=...)`.
+LLM 이 보는 계약은 같은 개념에 같은 이름을 써야 하고, 빌트인 섀도잉도 피한다.
+
+**3. `create_conference.data` 노출 여부.** 스펙 required 는
+`type,name,detail,timeout,data,pre_flow_id,post_flow_id` 7개인데 D-O2 는
+`type` 만 새로 노출한다고 적었다. 현재 툴은 `data={}` 를 하드코딩한다.
+→ **`data` 는 이번 릴리스에서 노출하지 않는다.** 용도가 문서화되어 있지 않고
+(스펙에 `type: object` 뿐), 빈 객체가 현재 동작이며, 형상을 모르는 자유 dict
+를 LLM 에게 여는 것은 §1 이 없애려는 free-form dict 패턴의 재도입이다.
+하드코딩 `{}` 를 유지하고 README 알려진 제약에 적는다.
+
+**4. create 툴의 기존 기본값.** D-N 은 "부분 업데이트 툴" 로 범위를
+한정했으므로, `create_campaign` 의 `service_level: int = 0`,
+`end_handle: str = "stop"` 같은 **기존 create 기본값은 건드리지 않는다.**
+이들은 서버 기본값과 일치하며 바꾸면 불필요한 파괴적 변경이 된다.
 
 **구 형태 호출의 0.2.0 동작을 명시한다**(v3 는 이것을 정하지 않아 구현자
 갈림 지점이었다): 구 파라미터를 **값과 함께** 넘기면 위 에러가 난다. 구
@@ -1165,3 +1230,5 @@ D-M5(`conferences`) 로 각각 처리했고, D-M 의 판정 기준을 산문에�
 | 8 | REQUEST_CHANGES | BLOCKER: **D-O 근거가 정반대** — 구 인자는 검증 에러를 내지 않고 pydantic 이 조용히 버려 **빈 업데이트가 200 으로 성공**(실측). 즉 D-O 는 장식이 아니라 §4-1 결함 재생산을 막는 부품 / `create_campaign` 신규 required 4개가 파괴적 변경 목록에 없음 — **실제로 hard-fail 하는 유일한 변경** / open question 4 의 다섯 번째 인스턴스는 `calls.py` 이며 §7 이 값 집합 없이 편집을 지시. 판정: 나머지는 구현 가능, §3 stopping rule 은 실제로 구속력 있음(숫자 종료 조건) | D-O 에 **실측 결과로 근거 교체**, **D-O1 신설**(신규 4필드를 `str\|None=None` 로 노출 → hard-fail 0건), **D-M4 신설**(`tel`\|`sip`\|`agent`\|`extension`, 감사 A-3.10 "전체" 대체), open question 4 종결, 리스크표 0.2.0 행 갱신 |
 | 9 | REQUEST_CHANGES | BLOCKER: **D-O1 근거가 사실오류** — `isValidOutplanID` 계열 4개가 전부 nil UUID 에서 `return true` 로 단락(`campaign.go:567,606,639,672`)하고 게이트웨이가 비포인터 `string` 에 `FromStringOrNil` 을 쓰므로, 생략 시 검증이 **전부 건너뛰어지고** 발신 불가 캠페인이 201 로 생성됨. MAJOR: `create_conference.timeout` 이 ms 로 문서화됐으나 서버는 초(`Timeout*1000` 이 증거) → 기본값이 1시간이 아니라 41.6일. MINOR: `stt_type` 은 4값(`ValidValues()` 가 `""` 제외), README 알려진제약 섹션 미제공, §3 sweep 주장 stale, D-E 인용 dangling. **여섯 번째 silent-drop 은 없음**(쓰기 툴 17개 전 필드 4계층 추적) | D-O1 근거를 Go 실측으로 교체 + docstring 이 "생략 시 미발신" 을 말하도록 규정, **D-M6 신설**(단위 오류 = 체크리스트 5번째 칸), §7 `stt_type` 4값 정정, README 알려진제약 섹션 신설, §3 sweep 주장 재범위화, dangling 인용 정리 |
 | 10 | **APPROVE** | 라운드 8 요구 3건 전부 substance 충족 확인(pydantic 동작 독립 재현, `outgoing_call.go`/`groupcallhandler` 로 주소집합 확인). 스코프 A 는 여전히 올바르게 경계지어짐(라운드 7~10 은 표면을 **좁히기만** 했음). 오버엔지니어링 없음(스케줄 잡 철회, 잔존 항목 전부 실측 트리거 보유). **리뷰 churn 리스크가 미발견 결함 리스크를 상회**하므로 구현 착수 권고. 단 D-O1 의 "hard-fail 0건" 이 새로 노출되는 3개 required 필드에는 미적용 | **D-O2 신설**(신규 노출 required 필드도 기본값 + 생략) |
+| 11 | REQUEST_CHANGES | 처방은 전부 유효하나 **근거 문장 3건이 거짓**: `EngineModelTargets` 는 19개가 아니라 **18개**(`main.go:131-150`), `POST /campaigns` 는 201 이 아니라 **200**(`server/campaigns.go:56`), `IsValidConferenceType` 는 "vendor 사본에만 존재" 가 아니라 **실소스에 정의는 있고 프로덕션 호출만 0건**. 인용 드리프트 3건. 수치 주장(52→58, 하한 1.2.0, 430 operations, ruff 26/4)은 전부 독립 재도출 일치 | 거짓 문장 3건 정정, 인용 3건 정정 |
+| 12 | REQUEST_CHANGES | **처음으로 문서를 실행해본 라운드.** BLOCKER: D-B 의 하한 설치 명령 `pip install "mcp==<floor>" dist/*.whl ".[dev]"` 가 **실행 불가**(`ResolutionImpossible` — pip 이 wheel 과 `.` 를 경쟁 배포판으로 인식). 더구나 빨간 CI 앞의 쉬운 수정이 `.[dev]` 제거이고 그러면 **하한 pytest 가 조용히 사라짐**. 시그니처 미결정 3건: `attachments` 원소 형상 미지정(라운드 4 BLOCKER 3 과 동종), 파라미터명 `type` vs `campaign_type` 충돌, `create_conference.data` 노출 여부. MINOR: 툴 개수 grep 합산 필요, 태그 게이트 `v` 접두사 | 하한 명령을 **`whl[dev]` 형태로 교정** + 틀린 수정 경고 명문화(실행 재현 포함), **D-O3 신설**(attachments 바디 표·파라미터명 통일·`data` 미노출·create 기본값 동결), grep 합산·`v` 접두사 정정 |
