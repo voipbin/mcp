@@ -1,6 +1,6 @@
 # voipbin/mcp 스코프 A 설계: 배포 복구 및 계약 정합성 (2026-09-28)
 
-Status: v3 (설계 리뷰 라운드 1–4 반영, 라운드 5·6 대기)
+Status: v4 (설계 리뷰 라운드 1–6 반영, 라운드 7·8 대기)
 
 선행 문서: `2026-09-28-mcp-server-audit.md` (이슈 분석, 5라운드 2연속 APPROVE 종료)
 
@@ -41,6 +41,34 @@ Status: v3 (설계 리뷰 라운드 1–4 반영, 라운드 5·6 대기)
   고치려면 주소/태그를 바꿀 실제 수단이 있어야 하고, 수단 없이 "이 필드는 못
   바꿉니다"만 남기는 것은 결함을 문서화할 뿐이다. (v1 은 이를 "본 설계가 스스로
   부여한 예외"처럼 서술했는데, 선행 승인 사항을 재논쟁으로 되돌린 오류였다.)
+
+  **원칙의 적용 범위 (stopping rule).** 이 원칙은 리뷰 라운드를 거치며 A 를
+  두 번 확장시켰다(+5 contacts, +1 `update_campaign_actions`). 종료 조건이
+  없으면 계속 확장되므로 여기서 확정한다. 다음 세 조건을 **모두** 만족할
+  때에만 A 에 새 툴을 추가한다.
+
+  1. 제거 대상 키가 **현재 배포된 docstring 에 실제로 존재**하고, 그 키를
+     넘기면 서버가 200/201 을 돌려주면서 값을 **조용히 버린다**. 에러가 나는
+     키는 이미 정직하므로 해당 없음.
+  2. 그 값을 바꾸는 **기존 operation 이 스펙에 이미 존재**한다. 신규 서버
+     기능을 요구하면 해당 없음.
+  3. 그 operation 이 **바디 필드 1개 수준의 단순 래퍼**로 노출 가능하다.
+     새 중첩 모델이나 새 파라미터 클래스가 필요하면 B.
+
+  세 조건을 만족하지 않으면 docstring 에서 키를 제거하고 README 의 알려진
+  제약 목록에 기재한 뒤 B 로 넘긴다.
+
+  **본 릴리스에서 이 규칙으로 확정된 신규 툴은 6개이며(contacts 5 +
+  `update_campaign_actions` 1), 이후 발견되는 동종 결함은 A 를 다시 확장하지
+  않고 B 로 보낸다.** 근거: A 의 go/no-go 는 감사 §3-1(배포 불능) 단독으로
+  성립하므로, A 의 추가 확장은 배포 복구를 지연시키는 순손실이다.
+
+  **전수 sweep 결과(라운드 5·6 및 CPO 직접 확인):** 쓰기 툴 전체를 훑어
+  동종 결함 추가 인스턴스는 없다. `update_flow`(`flows.py:66`)의
+  `name`/`detail`/`actions` 는 세 필드 모두 `paths/flows/id.yaml:49-61` 에
+  존재하며 required 전체 교체로 정직하게 선언되어 있다. 같은 파일의
+  `on_complete_flow_id` 는 **없는 필드가 아니라 노출하지 않은 필드**이므로
+  거짓 서술이 아니고 B 에 속한다(§3 마지막 항목).
 - `engine_key` 를 툴 파라미터로 계속 받을지 여부 (감사 §9-C). 본 PR 은
   docstring 의 **거짓 서술만** 고친다.
 - 툴 개수 상한 정책 (감사 §9-C).
@@ -525,7 +553,7 @@ async def update_campaign(campaign_id: str, fields: dict[str, Any]) -> str:
 ```
 
 `PUT /campaigns/{id}` 바디는 `name`, `detail`, `type`, `service_level`,
-`end_handle` **5개뿐이다** (`paths/campaigns/id.yaml:45-65` 실측). `actions` 는
+`end_handle` **5개뿐이다** (`paths/campaigns/id.yaml:48-65` 실측). `actions` 는
 **없다.** 즉 docstring 이 광고하는 `actions` 는 `create_contact` 의
 `phone_numbers` 와 **완전히 동일한 조용한 유실**이다.
 
@@ -543,7 +571,7 @@ async def update_campaign(campaign_id: str, fields: dict[str, Any]) -> str:
 contacts 와 동일한 논리이며, 한쪽만 적용하면 설계가 자기모순이다.
 
 `update_campaign` 의 명시 파라미터: `name`, `detail`, `type`,
-`service_level`, `end_handle` (= `paths/campaigns/id.yaml:45-65` 전체).
+`service_level`, `end_handle` (= `paths/campaigns/id.yaml:48-65` 전체).
 `actions` 는 파라미터에서 **제외**하고 docstring 에서도 제거한다. 명시
 파라미터로 바꾸기만 하고 `actions` 를 파라미터로 남기면 타입 주석이 붙은 채
 같은 버그를 배포하게 된다.
@@ -579,7 +607,8 @@ accurately rather than as a missing feature.
 
 원칙:
 - **닫힌 소집합이고 잘 안 바뀌는 것**(campaign type/end_handle, address type)
-  → 전체 값을 열거한다.
+  → **유효 값**을 전체 열거한다. 스펙 enum 이 아니라 **서버가 실제로 받아
+  저장하는 값**이다(D-M).
 - **자주 바뀌는 벤더 목록**(engine_model, stt_type, tts_type) → 대표 값 몇 개
   + "스펙 참조" 를 함께 적고, 예시가 전부가 아님을 명시한다.
 - **대형 enum**(action type 40개) → 전체 열거 대신 카테고리와 대표 값,
@@ -642,28 +671,27 @@ free-form dict 에서 명시 파라미터로 바뀌므로 **툴 호출 계약의
 
 | 파일 | 변경 | 관련 |
 |---|---|---|
-| `pyproject.toml` | **`mcp>=1.2.0,<2`**, 버전 `0.2.0`, ruff dev 의존성 + `[tool.ruff]` (`select = ["E4","E7","E9","F"]`, D-L), Python 3.13 분류자 | A-1.1, A-5.18, A-5.19, D-J, D-L |
+| `pyproject.toml` | **`mcp>=1.2.0,<2`**, 버전 `0.2.0`, ruff dev 의존성 + `[tool.ruff]` (`select = ["E4","E7","E9","F"]`, D-L), Python 3.13 분류자 | A-1.1, A-5.18, A-5.19, **D-A**, D-J, D-L |
 | `uv.lock` | **재생성** (`mcp` specifier 변경으로 무효화됨: `uv.lock:900` 의 `specifier = ">=1.0.0"`, `:322-323` 의 1.27.0). 재생성하지 않으면 `test` 잡이 relock 하며 트리가 dirty 해진다 | A-1.1 |
-| `.github/workflows/ci.yml` | `dist-smoke-latest` + `dist-smoke-floor` 잡 신설(런타임 기동 + 하한 pytest 포함), Python 3.13, ruff 게이트(`--select E4,E7,E9,F`) | A-1.2, A-5.18, D-B, D-L |
+| `.github/workflows/ci.yml` | `dist-smoke-latest` + `dist-smoke-floor` 잡 신설(런타임 기동 + 하한 pytest 포함, 하한 잡은 **Python 3.10·3.13** 두 개, D-P), Python 3.13, ruff 게이트(`--select E4,E7,E9,F`) | A-1.2, A-5.18, D-B, D-L, D-P |
 | `.github/workflows/dist-smoke.yml` | **신설** (`workflow_call` 재사용 워크플로, D-I) | A-1.2, A-1.3 |
-| `.github/workflows/enum-drift.yml` | **신설** (주간 `schedule:` 로 enum 스냅샷 재생성 후 diff 시 실패, §8-4) | A-5.16 |
 | `.github/workflows/publish.yml` | 재사용 스모크 호출, build-once-then-publish, `environment:` 게이트, 태그↔버전 검사, 액션 SHA 핀 | A-1.3, D-I |
-| `src/voipbin_mcp/client.py` | envelope 파싱 + `reason`/`request_id` 구조화 속성(`VoIPbinAPIError.__init__` 를 `(status_code, message, reason=None, request_id=None)` 로 확장, 기존 2-인자 호출 호환), **error_map 전면 재구성**, 429 + **`Retry-After` 부재 허용**, 원문 폴백 200자 절단, `VOIPBIN_API_BASE_URL`, 요청별 `Cookie` 헤더 + `VOIPBIN_AUTH_TRANSPORT` 스위치, **`import json` 섀도잉 정리**(`:3,:75,:85`) | A-2.6, A-2.7, A-5.15, D-C, D-D, D-H, D-L |
-| `src/voipbin_mcp/tools/contacts.py` | `addresses`/`tag_ids`, `source`/`external_id` 추가, **`update_contact` free-form dict → 명시 파라미터**, 하위 리소스 5툴 | A-2.4, A-2.5, D-E |
-| `src/voipbin_mcp/tools/campaigns.py` | enum 4값, required 4필드, **`update_campaign` free-form dict → 명시 파라미터 5개(`actions` 제외)**, **`update_campaign_actions` 툴 신설**, 모듈 요약문 | A-3.8, A-4.11, D-E, D-E2 |
-| `src/voipbin_mcp/tools/ais.py` | enum 5값, write-only 서술, required `parameter` | A-3.8, A-3.9, A-4.12 |
-| `src/voipbin_mcp/tools/flows.py` | action type 2값, uuid 예시 | A-3.8, A-3.10 |
-| `src/voipbin_mcp/tools/calls.py` | 주소 타입 전체 | A-3.10 |
+| `src/voipbin_mcp/client.py` | envelope 파싱 + `reason`/`request_id` 구조화 속성(`VoIPbinAPIError.__init__` 를 `(status_code, message, reason=None, request_id=None)` 로 확장, 기존 2-인자 호출 호환), **error_map 전면 재구성**, 429 + **`Retry-After` 부재 허용**, 원문 폴백 200자 절단, `VOIPBIN_API_BASE_URL`, 요청별 `Cookie` 헤더 + `VOIPBIN_AUTH_TRANSPORT` 스위치(**미인식 값은 즉시 실패**, D-P), **`import json` 섀도잉 정리**(`:3,:75,:85`) | A-2.6, A-2.7, A-5.15, D-C, D-D, D-H, D-L, D-P |
+| `src/voipbin_mcp/tools/contacts.py` | `addresses`/`tag_ids`, `source`/`external_id` 추가, **`update_contact` free-form dict → `None` sentinel 명시 파라미터 7개**(D-N), 하위 리소스 5툴(바디는 D-E 표), `addresses[].type` 을 **`tel`\|`email` 로 한정** + `target_name` 비대칭 명시(D-M), 구 `phone_numbers`/`emails`/`fields` 를 **받아서 거부**(D-O) | A-2.4, A-2.5, D-E, D-M, D-N, D-O |
+| `src/voipbin_mcp/tools/campaigns.py` | enum 4값, required 4필드, **`update_campaign` free-form dict → `None` sentinel 명시 파라미터 5개(`actions` 제외, `service_level` 은 `int\|None`)**(D-N), **`update_campaign_actions` 툴 신설**(D-E2), 구 `fields` 받아서 거부(D-O), 모듈 요약문 | A-3.8, A-4.11, D-E, D-E2, D-G, D-N, D-O |
+| `src/voipbin_mcp/tools/ais.py` | enum 5값, write-only 서술, required `parameter` | A-3.8, A-3.9, A-4.12, **D-G** |
+| `src/voipbin_mcp/tools/flows.py` | action type 2값, uuid 예시. `update_flow` 는 required 전체 교체로 이미 정직하므로 변경 없음(D-N sweep) | A-3.8, A-3.10, **D-G** |
+| `src/voipbin_mcp/tools/calls.py` | 주소 타입 **유효 값**만 열거(D-M) | A-3.10, **D-G**, D-M |
 | `src/voipbin_mcp/tools/emails.py` | `attachments` | A-4.13 |
 | `src/voipbin_mcp/tools/conferences.py` | required 전체, `type` 하드코딩 해제 | A-4.13 |
 | `src/voipbin_mcp/tools/routes.py` | **"accesskey 로 사용 불가" 명시** (superadmin 전용 아님, §5.4b) | A-5.14, D-F |
-| 모든 list 툴 | page_size 1–100 명시 | A-3.10 |
+| 모든 list 툴 | page_size 1–100 명시 | A-3.10, **D-G** |
 | `tests/test_client.py` | **기존 픽스처 교정**: envelope 중첩 형태로 교체(`:62,71,91`), **accesskey URL 단언 재작성**(`:45,:56` → Cookie 헤더 존재 + URL 에 accesskey **부재**), **POST/PUT/DELETE 테스트(`:80,:100,:111`)에도 인증 단언 추가**(공유 헬퍼 `client.py:79,89,99`), base URL 기본값 단언(`:21-22`) 유지 + 환경변수 오버라이드 추가, 429(`Retry-After` 유/무 both) 테스트, `import os` 미사용 정리(`:1`) | A-2.6, A-5.15, A-5.16, D-D, D-L |
 | `tests/test_tools_contacts.py` 외 4개 | 신설 | A-5.16 |
 | `tests/data/openapi_enums.json` | **신설** (스펙에서 생성한 enum 스냅샷, §8-4) | A-5.16 |
 | `scripts/regen_openapi_enums.py` | **신설** (스냅샷 재생성 스크립트, §8-4) | A-5.16 |
 | `README.md` | 예시(새 파라미터 형태로), **격리 설치(uvx/pipx) 우선 안내 + 공유 venv 다운그레이드 경고**, Security Note, `VOIPBIN_API_BASE_URL`/`VOIPBIN_AUTH_TRANSPORT`, 지원 범위, **툴 목록 표(`README.md:69-88`)에 신규 6개 행 추가** | A-5.17, D-K |
-| `CHANGELOG.md` | **신설** (0.2.0 파괴적 변경 명시) | D-J |
+| `CHANGELOG.md` | **신설** (0.2.0 파괴적 변경 + 마이그레이션 before/after 코드 + 0.3.0 에서 구 파라미터 제거 예정) | D-J, D-O |
 | `docs/RELEASING.md` | **신설** (yank + 재배포 절차) | D-J |
 
 `src/voipbin_mcp/server.py` 는 A 범위 변경이 없다. v1 표의 "page_size 상한
@@ -707,19 +735,38 @@ docstring 반영 지원" 행은 실제 변경을 서술하지 않았다. `valida
    커밋하고, `scripts/regen_openapi_enums.py` 로 재생성한다. 테스트는 docstring
    값이 스냅샷의 부분집합인지 본다.
 
-   **트리거를 반드시 함께 넣는다 (리뷰 라운드 4 MAJOR).** v2 는 재생성을
-   "monorepo 가 있을 때 실행, diff 를 리뷰에서 확인" 이라고만 써서 **아무런
-   트리거가 없었다.** 사람이 스크립트를 돌리기로 마음먹을 때까지 스냅샷과
-   docstring 은 둘 다 이 저장소 안에 얼어붙은 산출물이고, 그것은 v1 방식에
-   제기한 비판과 **구조적으로 동일하다.** 파일 확장자만 바뀐 셈이다.
+   **트리거를 넣으려 했으나 철회한다 (리뷰 라운드 4 제안 → 라운드 6 반박,
+   라운드 6 채택).** v3 는 주간 `schedule:` 잡을 추가했다. 라운드 6 이 세 가지
+   이유로 반박했고, 확인 결과 전부 맞다.
 
-   → monorepo 쪽 CI 에 **스펙 변경 시 이 저장소로 알림을 보내는 스텝**을 걸거나
-   (voipbin/monorepo 의 openapi 변경 감지 → `voipbin/mcp` 에 issue 생성),
-   그것이 과하다면 **주간 스케줄 잡**(`schedule:` cron)으로 재생성해 diff 가
-   있으면 실패시킨다. 후자가 기존 도구(GitHub Actions)만 쓰고 더 단순하므로
-   **주간 스케줄을 채택한다.** 트리거 없는 스냅샷은 A 에서 빼고 B 로 넘기는
-   것이 정직하다는 리뷰 지적에 동의하며, 트리거를 넣어 약속한 성질을 실제로
-   갖추는 쪽으로 해결한다.
+   - **필요한 순간에 스스로 꺼진다.** `voipbin/mcp` 는 public 이고 GitHub 는
+     저장소 비활동 60일 후 `schedule:` 워크플로를 자동 비활성화한다. 이
+     저장소의 이력이 바로 반례다: 마지막 푸시 2026-04-06, 다음 활동
+     2026-09-28 (약 6개월). 이 PR 에 주간 잡을 넣었더라도 그 기간 중 넉 달은
+     **아무 신호 없이 죽어 있었다.** 드리프트가 생기는 조용한 기간에 정확히
+     실패하는 메커니즘이다.
+   - **리스크 등급과 모순된다.** §9 는 enum 드리프트를 `낮음` 으로 둔다.
+     낮은 리스크에 상시 워크플로를 새로 세우는 것은 오버엔지니어링이다.
+   - **구현 불가다.** 스크립트가 스펙을 어디서 읽는지 정해지지 않았다. 로컬
+     monorepo 체크아웃 경로는 스케줄 런에서 존재하지 않는다.
+
+   → **`.github/workflows/enum-drift.yml` 을 A 에서 뺀다.** 유지하는 것은
+   `tests/data/openapi_enums.json` + `scripts/regen_openapi_enums.py` +
+   부분집합 테스트뿐이며, 이들은 **기존 PR CI 안에서 돌아가고 새 상시 체계를
+   만들지 않는다.**
+
+   **정직한 한계 서술:** 이 구성은 **docstring ↔ 스냅샷 divergence 만** 잡는다.
+   진짜 스펙 드리프트 감지는 monorepo 쪽 훅이 필요하며 **B 로 이연**한다.
+   B 의 근거가 될 실측 트리거를 기록해 둔다: 지난 12개월간
+   `bin-openapi-manager/openapi/openapi.yaml` 의 `enum:` 변경 커밋 **48건**.
+   드리프트 발생 가능성은 사실상 확실하고, 영향은 서버 400 이므로 낮다.
+
+   스냅샷 생성 스크립트의 스펙 입력은 **`voipbin/monorepo` raw URL 을 ref 로
+   핀해서** 읽는다(인증 없이 200). 로컬 경로가 있으면 그것을 우선한다. 기대
+   enum 집합은 **툴 → 스펙 스키마명 매핑 표**를 스크립트가 들고 있으며,
+   docstring 산문을 파싱하지 않는다. D-G 가 docstring 형식을 의도적으로
+   불균일하게 두므로 산문 파싱은 불가능하다. 검사 대상은 **닫힌 소집합 enum**
+   (campaign type/end_handle, address type, stt/tts/engine_model)로 한정한다.
 5. **뮤테이션 확인**: 새 테스트가 tautology 가 아닌지, 고친 코드를 일부러
    되돌려 실패하는지 확인한다.
 6. 라이브 스모크: 실계정으로 **GET/POST/PUT/DELETE 전부** 최소 1건씩 호출해
@@ -730,17 +777,27 @@ docstring 반영 지원" 행은 실제 변경을 서술하지 않았다. `valida
 
 | 리스크 | 정도 | 대응 |
 |---|---|---|
-| **0.2.0 의 파괴적 툴 계약 변경이 기존 사용자를 깨뜨림** | **높음** | mcp 1.x 가 이미 깔린 환경의 0.1.1 사용자는 **지금 정상 동작 중**이다(PyPI 파손은 새로 해석하는 설치에만 발생). 그들에게 `create_contact(phone_numbers=...)` → `addresses=...`, `update_contact(fields=...)` → 명시 kwargs 는 저장된 에이전트 설정·프롬프트 템플릿을 깨뜨린다. "설치가 모두에게 깨져 있다"는 이 집단에 대한 변호가 되지 않는다. → CHANGELOG 에 마이그레이션 before/after 를 코드로 제시하고, minor bump 로 신호하며, README 예시를 새 형태로 갱신한다. |
+| **0.2.0 의 파괴적 툴 계약 변경이 기존 사용자를 깨뜨림** | **높음** | mcp 1.x 가 이미 깔린 환경의 0.1.1 사용자는 **지금 정상 동작 중**이다(PyPI 파손은 새로 해석하는 설치에만 발생). 그들에게 `create_contact(phone_numbers=...)` → `addresses=...`, `update_contact(fields=...)` → 명시 kwargs 는 저장된 에이전트 설정·프롬프트 템플릿을 깨뜨린다. → **능동 마이그레이션(D-O)**: 구 파라미터를 한 마이너 버전 동안 **받아서 거부**하고 지시적 에러를 돌려준다. CHANGELOG·README 는 보조 수단이다. |
 | 쿠키 전송이 일부 프록시에서 막힘 | **중간** (셀프호스팅 ingress 는 미검증) | 관리형 엔드포인트 실측 200 확인. `VOIPBIN_AUTH_TRANSPORT=query` 스위치를 **같은 릴리스에** 넣어 우회 경로를 제공(D-D). |
 | `mcp<2` 상한이 공유 venv 의 mcp 2.x 를 **다운그레이드** | **중간** | 단순 배제가 아니라 다른 MCP 서버를 깨뜨릴 수 있다. README 가 격리 설치(uvx/pipx)를 우선 안내하고 공유 venv 경고를 명시한다(D-K). |
 | **공식 문서가 서드파티 fork 를 안내 중** | **중간** | `bin-api-manager/docsdev/source/ai_overview.rst:685` 가 `https://github.com/nrjchnd/voipbin-mcp` 를 가리킨다. 공식 저장소의 0.2.0 을 내면서 문서는 남의 fork 를 권하는 상태는 일관되지 않다. **본 PR 범위 밖(다른 저장소)이므로 후속 필수 항목으로 등록한다.** |
-| enum 드리프트 재발 | 낮음 | §8-4 의 스펙 생성 스냅샷 + **주간 스케줄 재생성 잡**으로 기계적으로 가시화. |
+| enum 드리프트 재발 | **발생 가능성 높음 / 영향 낮음** (지난 12개월 `enum:` 변경 48커밋, 증상은 서버 400) | A 는 `tests/data/openapi_enums.json` 부분집합 테스트로 docstring↔스냅샷 divergence 만 잡는다. 진짜 스펙 드리프트 감지는 monorepo 훅이 필요하며 **B 로 이연**(§8-4). 상시 스케줄 잡은 60일 비활동 시 자동 비활성화되어 정작 필요한 기간에 죽으므로 채택하지 않는다. |
+| **라이브 스모크가 운영 계정에 테스트 리소스를 남김** | 중간 | §8-6 이 실계정 POST/PUT/DELETE 를 요구한다. 생성한 리소스는 **같은 스모크 스크립트가 DELETE 로 회수**하고, 이름에 `mcp-smoke-` 접두사를 붙여 식별 가능하게 한다. 회수 실패 시 스모크를 실패로 처리한다. |
 | 버전 bump 후 릴리스가 또 깨짐 | 낮음 | D-I 의 publish 게이트 + D-B 의 양 끝 스모크(런타임 기동·하한 pytest 포함). 실패 시 D-J 의 yank 절차. |
 | `validate_page_size` 의 조용한 값 보정 유지 | 수용 | `page_size=0` → 1, 비정수 → 10 으로 조용히 바뀐다. 데이터 유실과 달리 결과가 왜곡되지 않고 도구 재호출로 복구되므로 A 에서는 docstring 명시만 한다. **의도적 수용이며 누락이 아니다.** |
 | `create_contact` 의 `addresses` 가 `list[dict]` 로 남음 | 수용 | 원소 스키마 강제는 중첩 모델이 필요하고 mcp 버전 간 처리가 다르다(§5.1). docstring 열거로 완화, 강제는 B. |
 
 (v2 의 "contacts 하위 툴 5개 추가가 A 범위를 넘는다는 지적 | 해소됨" 행은
 삭제했다. 리스크가 아니라 리뷰 처리 결과이며 표를 부풀렸다. 근거는 §3 에 있다.)
+
+### D-K. README 설치 안내 순서
+
+`pip install voipbin-mcp` (`README.md:11-13`) 를 첫 안내로 두면, mcp 2.x 가 있는
+공유 venv 사용자는 `mcp<2` 상한 때문에 **mcp 가 1.x 로 다운그레이드되어 다른
+모든 MCP 서버가 깨진다.** `uvx` (`README.md:18`) 는 격리 실행이라 안전하다.
+
+→ README 는 `uvx`/`pipx` 격리 설치를 **먼저** 안내하고, `pip install` 은 전용
+venv 를 전제로 한 대안으로 배치한다. 공유 환경 다운그레이드 경고를 명시한다.
 
 ### D-L. ruff 규칙 집합 확정 (`--select E4,E7,E9,F`)
 
@@ -749,14 +806,17 @@ v2 는 "ruff 게이트"만 적어 규칙 집합을 정하지 않았다. 리뷰 �
 만든다. 직접 확인했다(ruff 0.16.9, 현재 트리):
 
 ```
-$ ruff check .                            → 52 errors (20+ files)
-$ ruff check --select E4,E7,E9,F .        → 8 errors (4 files, 중복 제외 4건)
+$ ruff check .                            → 26 errors
+$ ruff check --select E4,E7,E9,F .        → 4 errors (2 files)
 ```
 
 기본 규칙셋은 `I001`(import 정렬)을 `tools/{activeflows,agents,billings,
 conversations,customer,extensions,messages,numbers,queues,tags}.py` 등 **§7 이
 "변경 없음"으로 선언한 모듈 전부**에서 발생시키고, `server.py` 에도
 `RUF100` 을 낸다.
+
+(v3 는 52건/8건으로 적었는데, 그것은 **base 저장소** 측정치였다. 이 worktree
+기준으로는 26건/4건이다. 결론은 같지만 구현자가 재현할 수 없는 숫자였다.)
 
 → **`--select E4,E7,E9,F` 로 고정한다.** 이 집합의 위반은 전부 §7 이 이미
 변경 대상으로 올린 파일 안에 있다:
@@ -775,14 +835,149 @@ tests/test_client.py:1:8        F401  `os` imported but unused
 스타일 규칙(`I001` 등)을 넣으려면 전 모듈 포매팅이 따라와야 하므로, 그것은
 별도 작업으로 분리한다. A 는 **실제 버그를 잡는 규칙만** 켠다.
 
-### D-K. README 설치 안내 순서
+### D-M. 스펙 enum ≠ 유효 enum: 서버가 조용히 버리는 값을 문서화하지 않는다
 
-`pip install voipbin-mcp` (`README.md:11-13`) 를 첫 안내로 두면, mcp 2.x 가 있는
-공유 venv 사용자는 `mcp<2` 상한 때문에 **mcp 가 1.x 로 다운그레이드되어 다른
-모든 MCP 서버가 깨진다.** `uvx` (`README.md:18`) 는 격리 실행이라 안전하다.
+**리뷰 라운드 5 가 찾은 이 결함 클래스의 네 번째 인스턴스다. 그리고 D-E/D-G 가
+그것을 유발한다.**
 
-→ README 는 `uvx`/`pipx` 격리 설치를 **먼저** 안내하고, `pip install` 은 전용
-venv 를 전제로 한 대안으로 배치한다. 공유 환경 다운그레이드 경고를 명시한다.
+v3 의 D-E 는 "`CommonAddress` 필드를 정확히 열거" 하라고 썼고 D-G 는 "address
+type → 전체 값을 열거한다" 라고 썼다. `CommonAddress.type` 의 스펙 enum 은
+**9개**다(`openapi.yaml:3636-3644`: `""`, agent, conference, email, extension,
+line, sip, tel, web_session). 지시를 따르면 구현자는 9개를 열거한 docstring 을
+쓴다.
+
+그런데 contact 쓰기 경로는 **3개만 받고 나머지는 에러 없이 버린다**
+(`bin-contact-manager/pkg/contacthandler/contact.go:48-54, 88-93`):
+
+```go
+func isValidContactAddressType(t commonaddress.Type) bool {
+	switch t {
+	case commonaddress.TypeTel, commonaddress.TypeEmail, commonaddress.TypeWebSession:
+		return true
+	default:
+		return false
+	}
+}
+...
+for _, a := range addresses {
+	if !isValidContactAddressType(a.Type) {
+		log.Warnf("Invalid contact address type. type: %v", a.Type)
+		continue        // 조용히 건너뜀. POST 는 그대로 201.
+	}
+```
+
+`web_session` 은 공개 표면에서 의도적으로 제외되므로(`models/contact/
+address.go` 의 `ReachableAddressTypes`) 써도 응답에 나타나지 않는다.
+즉 LLM 이 `{"type":"sip", ...}` 를 넘기면 **201 이 떨어지고 주소는 사라진다.**
+`create_contact` 의 `phone_numbers`, `update_campaign` 의 `actions`,
+`add_contact_address` 의 `target_name` 과 **같은 버그의 네 번째 발현**이며,
+그것을 막으려고 쓴 섹션이 재도입하고 있었다.
+
+**일반 규칙 (이 네 건이 모두 위반한 불변식):**
+
+> docstring 은 **서버가 받아들이고 또 저장하는** 값만 광고한다. 핸들러가
+> 특정 값에 대해 `continue` 하거나 무시하면, 그 값은 스펙 enum 에 있어도
+> **유효 enum 이 아니다.** 스펙 enum ⊋ 유효 enum 인 지점을 찾아 좁은 쪽을
+> 문서화한다.
+
+적용:
+- `create_contact` 의 `addresses[].type` → **`tel` | `email` 로 한정**한다.
+  하위 리소스 POST(`id_addresses.yaml:27`)가 이미 이 둘로 제한되어 있어
+  두 표면의 문서가 일치하게 된다.
+- `target_name` 은 `CommonAddress` 에 존재하지만(`openapi.yaml:3659`)
+  `add_contact_address` 바디에는 없다. `create_contact.addresses` 는
+  `CommonAddress` 를 참조하므로 거기서는 legal 이고 하위 리소스에서는 아니다.
+  **이 비대칭을 docstring 양쪽에 명시**한다. 적지 않으면 두 툴의 문서가
+  서로 모순된다.
+- D-G 의 "address type → 전체 값 열거" 항목을 **"유효 값만 열거"** 로
+  고친다.
+
+### D-N. 부분 업데이트 sentinel: `None` 기본값 + 비-None 만 전송
+
+**리뷰 라운드 6 이 찾은 BLOCKER다. v3 는 "명시 파라미터로 바꾼다" 고만 쓰고
+값이 없을 때의 표현을 정하지 않았다.** 그 결과 합리적인 구현자 둘이
+**데이터를 파괴하는 쪽과 그렇지 않은 쪽으로 갈린다.**
+
+서버는 PATCH 형 의미를 갖는다. `PutContactsIdJSONBody` 는 전 필드가
+`*string ... omitempty` 이고(생성 코드), `bin-contact-manager/pkg/
+listenhandler/v1_contacts.go:205-225` 는 **nil 이 아닌 포인터만** 업데이트
+맵에 넣는다. 즉 **키가 `""` 로 존재하면 빈 문자열을 쓰는 실제 업데이트**다.
+
+```go
+fields := make(map[contact.Field]any)
+if reqData.FirstName != nil { fields[contact.FieldFirstName] = *reqData.FirstName }
+...
+```
+
+구현자 갈림:
+- **A**: 저장소 내 선례인 `create_contact`(`contacts.py:63-79`, `if first_name:`)
+  를 따라 `str = ""` + falsy-omit. 결과는 대체로 맞지만 **필드를 비울 수
+  없다.**
+- **B**: 선언된 파라미터 전부로 바디를 만든다. `update_contact(id,
+  first_name="Kim")` 이 나머지 6개를 `""` 로 보내 **company/job_title/notes/
+  external_id/last_name/display_name 를 지운다.** 이 PR 이 없애려는 조용한
+  유실보다 **더 나쁘다.**
+
+`update_campaign` 은 더 위험하다. `service_level: int` 는 **`0` 이 유효
+값**이므로(`create_campaign` 의 기본값, `campaigns.py:43`) falsy-omit 은
+`service_level=0` 을 설정 불가로 만들고, `int = 0` + 항상 전송은 이름만
+바꿀 때마다 service level 을 0 으로 되돌린다.
+
+**확정 규칙 (두 툴 및 향후 모든 부분 업데이트 툴에 동일 적용):**
+
+> 모든 선택 파라미터의 기본값은 `None` 이며 타입은 `str | None` /
+> `int | None` 이다. 요청 바디에는 **`None` 이 아닌 파라미터만** 포함한다.
+> 빈 문자열 `""` 은 유효한 값(필드 비우기)으로 그대로 전달한다.
+> `create_contact` 의 기존 falsy-omit 패턴도 이 규칙으로 통일한다.
+
+`update_flow`(`flows.py:66`)는 `name`, `detail`, `actions` 를 **required 로
+선언하고 전체 교체임을 docstring 에 명시**하고 있으므로 이 규칙의 대상이
+아니다. 세 필드 모두 스펙에 존재한다(`paths/flows/id.yaml:49-61`).
+
+### D-O. 0.2.0 능동 마이그레이션: 구 파라미터를 받아서 거부한다
+
+**리뷰 라운드 6 지적을 수용한다.** v3 의 완화책(CHANGELOG, minor bump,
+README)은 전부 **수동적**이다. 사용자가 무언가를 읽어야 작동한다. 그런데
+위험 집단으로 특정한 사람들은 **지금 정상 동작 중이라 아무것도 읽지 않고
+자동 업그레이드되는** 집단이다. 그들의 첫 증상은 `fields=` / `phone_numbers=`
+에 대한 불투명한 MCP 스키마 검증 실패다.
+
+→ `phone_numbers`, `emails`(`create_contact`), `fields`(`update_contact`,
+`update_campaign`) 를 **한 마이너 버전 동안 파라미터로 계속 받되, 값이 오면
+서버에 보내지 않고 지시적 에러를 던진다.**
+
+```
+phone_numbers was removed in 0.2.0. Use addresses=[{"type": "tel",
+"target": "+1...", "is_primary": true}] instead. See CHANGELOG.
+```
+
+근거:
+- §3 의 원칙과 일관된다. **명시적 에러도 수단**이며, 조용한 실패보다 낫다.
+- LLM 이 행동 가능한 형태다. 스키마 검증 실패는 LLM 이 고칠 방법을 모르지만,
+  이 메시지는 다음 호출을 정확히 지시한다.
+- 조용한 유실 경로를 되살리지 않는다. **아무것도 서버로 전달되지 않는다.**
+- 6줄 수준이고 새 인프라가 없다.
+
+0.3.0 에서 이 파라미터들을 완전히 제거한다. CHANGELOG 에 제거 예정을 명시한다.
+
+**구 형태 호출의 0.2.0 동작을 명시한다**(v3 는 이것을 정하지 않아 구현자
+갈림 지점이었다): 구 파라미터를 **값과 함께** 넘기면 위 에러가 난다. 구
+파라미터를 넘기지 않으면 아무 영향이 없다.
+
+### D-P. 남은 구현자 갈림 지점 확정
+
+리뷰 라운드 6 이 지적한 나머지 모호점을 여기서 닫는다.
+
+- **`dist-smoke-floor` 의 Python 버전**: `3.10`(= `requires-python` 하한) 과
+  `3.13` 두 개로 돌린다. 하한 의존성 × 하한 런타임 조합이 가장 깨지기 쉽고,
+  3.13 은 A-5.18 이 CI 에 추가하는 최신 버전이다. 중간 버전은 `test` 잡의
+  기존 매트릭스가 덮는다.
+- **`VOIPBIN_AUTH_TRANSPORT` 미인식 값**: **즉시 실패**한다(기동 시 `ValueError`).
+  조용히 쿠키로 폴백하면 사용자는 `VOIPBIN_AUTH_TRANSPORT=quiery` 오타를
+  영원히 모른다. 허용 값은 `cookie`(기본), `query` 둘뿐이다.
+- **`format_response` / `validate_page_size`**: 변경 없음. §7 에 행을 두지
+  않는다.
+
 
 ## 10. Open questions (리뷰어 판단 요청)
 
@@ -793,12 +988,13 @@ venv 를 전제로 한 대안으로 배치한다. 공유 환경 다운그레이�
 3. D-J: `Development Status :: 4 - Beta` 유지 판단이 타당한가. 배포가 처음으로
    실제 동작하게 되는 릴리스이므로 Beta 주장이 정당해진다고 봤으나, 릴리스
    이력이 한 번 깨진 전례를 감안하면 Alpha 강등이 정직한 선택일 수도 있다.
-4. §8-4 의 주간 스케줄 잡이 "트리거 없는 스냅샷" 문제를 실제로 해결하는가,
-   아니면 스냅샷 자체를 B 로 넘기는 것이 맞는가. 라운드 4 는 후자를 권했고
-   본 설계는 트리거를 넣는 쪽을 택했다.
-5. D-E2 로 툴이 하나 더 늘었다(58개). contacts 5개와 마찬가지로 "허위 키를
-   정직하게 제거하려면 실제 수단이 필요하다"는 §3 원칙의 귀결인데, 이 원칙이
-   A 를 계속 확장시키는 방향으로 작동하는 것을 어디서 멈춰야 하는가.
+4. D-M/D-N 이 닫은 두 결함(스펙 enum ≠ 유효 enum, 부분 업데이트 sentinel)
+   외에 같은 클래스가 더 남아 있는가. 쓰기 툴 전수 sweep 은 했으나, 이 클래스는
+   네 번 연속 발견됐으므로 다섯 번째를 의심하는 것이 합리적이다.
+
+(v3 의 질문 4·5 는 해소됐다. 4 → §8-4 에서 스케줄 잡을 **철회**하고 한계를
+정직하게 서술 + B 이연 근거(48커밋) 기록. 5 → §3 에 stopping rule 3조건을
+명문화하고 "본 릴리스 신규 툴 6개로 확정, 이후 동종 결함은 B" 로 종료.)
 
 (v1 의 질문 3·4 는 해소됐다. 3 → §8-4 에서 스펙 생성 스냅샷으로 해결. 4 →
 감사 §9-A item 5 가 이미 명령한 항목이므로 스코프 위반이 아니다.)
@@ -811,3 +1007,5 @@ venv 를 전제로 한 대안으로 배치한다. 공유 환경 다운그레이�
 | 2 | CHANGES_REQUESTED | 동일 BLOCKER 2건 독립 발견. MAJOR: free-form `fields` dict 로 조용한 유실 경로 잔존 / 쿠키 전용은 셀프호스팅 우회수단 없음 / base URL 계약 미정의 / 릴리스 게이트 서술 불충분 + environment 게이트 누락 / error_map 이 메시지 폐기 / mcp<2 가 공유 venv 다운그레이드 / 버전·롤백 미정 | D-E 에 명시 파라미터 전환 추가, D-D 에 `VOIPBIN_AUTH_TRANSPORT` 폴백 + 요청별 Cookie 헤더 고정, D-H 신설(§5.5 로 선례 실증), D-I 신설, D-C 에 error_map 재구성 명시, D-K 신설, D-J 신설(0.2.0 + yank 절차), §3 에서 contacts 예외 프레이밍 철회 |
 | 3 | REQUEST_CHANGES | MAJOR: §5.1 의 "시그니처 동일" 주장이 새 하한 1.2.0 에서 거짓 / D-B 가 런타임 진입점·하한 pytest 를 여전히 미검증 / `update_campaign` 의 `actions` 가 동일 유실 결함인데 수단 없이 제거됨 / ruff 규칙셋 미지정으로 게이트가 §7 과 모순. MINOR: 429 사이트 3곳이며 셋째는 `Retry-After` 없음, 하한 CI 예시가 리터럴, 테스트 행이 POST/PUT/DELETE 인증 미포함 | §5.1 에 버전별 시그니처 실측표 + 교집합 불변식 명시, D-B 에 stdio 기동·하한 pytest 추가 + 파생 예시로 교체, **D-E2 신설**(`update_campaign_actions` 툴 추가), **D-L 신설**(`--select E4,E7,E9,F` 실측 확정), 429 3사이트 표 + 헤더 부재 허용 명시, §7 테스트 행 확장 |
 | 4 | REQUEST_CHANGES | BLOCKER: `update_campaign` 의 `actions` 허위 키 미명명 / §3 원칙이 campaigns 에 미적용(자기모순) / 신규 5툴 바디 미명세로 `target_name`·`type` 오전송 유발. MAJOR: enum 스냅샷에 트리거가 없어 v1 비판과 구조 동일 / 리스크표에 0.2.0 파괴적 변경 행 없음. MINOR: 공식문서가 서드파티 fork 안내, 툴 개수 2곳 중복, README 툴표 누락, 에러 생성자 미정 | D-E2 에 결함 명명 + 파라미터 5개 열거, D-E 표에 3개 바디 스펙 실측 열 추가 + `list[dict]` 수용 명시, §8-4 에 **주간 스케줄 트리거** 추가, 리스크표에 0.2.0 행(높음)·fork 행 추가 + 리뷰처리 행 삭제, 툴 개수를 grep 파생으로 단일화, §7 에 README 툴표·에러 생성자 시그니처 명시 |
+| 5 | REQUEST_CHANGES | BLOCKER: 동일 결함 클래스 **4번째** 인스턴스 — `create_contact.addresses[].type` 이 스펙 9값인데 서버는 3값만 받고 `continue` 로 버림, 그리고 D-E/D-G 가 9값 열거를 지시 / §7 이 D-A·D-G 미추적. MINOR: ruff 52건은 base 측정치(worktree 26건), campaigns id.yaml 인용 off-by-3 | **D-M 신설**(스펙 enum ≠ 유효 enum 일반 규칙 + `tel`\|`email` 한정 + `target_name` 비대칭), D-G 를 "유효 값 열거" 로 수정, §7 에 D-A·D-G 추적 추가, 측정치·인용 정정 |
+| 6 | REQUEST_CHANGES | BLOCKER: 부분 업데이트 sentinel 미정 → 구현자 B 는 미지정 필드를 `""` 로 덮어써 **데이터 파괴**(`service_level=0` 문제 포함) / §3 원칙에 정지 규칙 없음 / 주간 스케줄 잡은 60일 비활동 시 자동 비활성화되어 무용 + 구현 불가. MAJOR: 0.2.0 완화책이 전부 수동적 | **D-N 신설**(`None` sentinel 확정), **§3 에 stopping rule 3조건 + 신규 툴 6개 확정** 명문화, §8-4 에서 **스케줄 잡 철회** + 한계 서술 + B 이연 근거 48커밋 기록, **D-O 신설**(구 파라미터 받아서 거부), **D-P 신설**(하한 잡 Python 3.10·3.13, `VOIPBIN_AUTH_TRANSPORT` 미인식 값 즉시 실패), 리스크표에 라이브 스모크 잔여물 행 추가 + enum 등급 정직화 |
