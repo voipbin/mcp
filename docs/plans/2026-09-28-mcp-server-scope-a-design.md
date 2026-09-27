@@ -1058,12 +1058,13 @@ phone_numbers was removed in 0.2.0. Use addresses=[{"type": "tel",
 
 0.3.0 에서 이 파라미터들을 완전히 제거한다. CHANGELOG 에 제거 예정을 명시한다.
 
-#### D-O1. `create_campaign` 의 신규 required 4개 — 유일한 hard-fail
+#### D-O1. `create_campaign` 의 신규 required 4개
 
 D-J 의 파괴적 변경 목록은 위 3개만 들었는데, **누락이 있다.** A-4.11 이
 `create_campaign` 에 `outplan_id`, `outdial_id`, `queue_id`,
-`next_campaign_id` 를 required 로 추가한다. 위 실측이 보여주듯 **이것이 기존
-호출자를 실제로 즉시 깨뜨리는 유일한 변경**이다(`ToolError: Field required`).
+`next_campaign_id` 를 required 로 추가한다. 위 실측이 보여주듯 구 파라미터와
+달리 **이것은 기존 호출자를 즉시 깨뜨린다**(`ToolError: Field required`).
+같은 위험이 새로 노출되는 다른 required 필드에도 있다(D-O2).
 그리고 D-O 방식으로는 덮을 수 없다. 없는 필드를 "받아서 거부" 할 수 없다.
 
 → **`str | None = None` 으로 노출하고 `None` 이면 바디에서 생략한다**(D-N 과
