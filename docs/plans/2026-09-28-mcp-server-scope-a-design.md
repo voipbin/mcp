@@ -1,6 +1,6 @@
 # voipbin/mcp 스코프 A 설계: 배포 복구 및 계약 정합성 (2026-09-28)
 
-Status: v5 (설계 리뷰 라운드 1–8 반영, 라운드 9·10 대기)
+Status: v6 (설계 리뷰 라운드 1–10 반영)
 
 선행 문서: `2026-09-28-mcp-server-audit.md` (이슈 분석, 5라운드 2연속 APPROVE 종료)
 
@@ -63,8 +63,11 @@ Status: v5 (설계 리뷰 라운드 1–8 반영, 라운드 9·10 대기)
   않고 B 로 보낸다.** 근거: A 의 go/no-go 는 감사 §3-1(배포 불능) 단독으로
   성립하므로, A 의 추가 확장은 배포 복구를 지연시키는 순손실이다.
 
-  **전수 sweep 결과(라운드 5·6 및 CPO 직접 확인):** 쓰기 툴 전체를 훑어
-  동종 결함 추가 인스턴스는 없다. `update_flow`(`flows.py:66`)의
+  **전수 sweep 결과(라운드 9 가 4계층 체크리스트로 쓰기 툴 17개 전 필드를
+  추적, CPO 재확인):** **신규 툴 추가를 요하는** 동종 결함(silent drop)은
+  더 없다. 라운드 5~9 가 찾은 추가 결함들(`target_name`, `stt_type`,
+  `engine_model`, `calls.py`, `conferences.py`)은 전부 **docstring 수정으로
+  닫히며 새 툴을 요구하지 않으므로** 이 규칙의 대상이 아니다(D-M1~D-M6). `update_flow`(`flows.py:66`)의
   `name`/`detail`/`actions` 는 세 필드 모두 `paths/flows/id.yaml:49-61` 에
   존재하며 required 전체 교체로 정직하게 선언되어 있다. 같은 파일의
   `on_complete_flow_id` 는 **없는 필드가 아니라 노출하지 않은 필드**이므로
@@ -492,8 +495,8 @@ README Security Note 를 함께 갱신한다.
 | `delete_contact_tag` | DELETE `/contacts/{id}/tags/{tag_id}` | 바디 없음 |
 
 **바디를 여기에 명시하는 이유 (리뷰 라운드 4 BLOCKER 3):** v1/v2 는 경로만
-적었다. 구현자가 위쪽의 `CommonAddress` 서술("`type`, `target`, `target_name`
-등")을 그대로 재사용하면 POST 에 **존재하지 않는 `target_name`** 을 보내고
+적었다. 구현자가 스펙의 `CommonAddress` 정의를 그대로 재사용하면 POST 에
+**게이트웨이가 읽지 않는 `target_name`** 을 보내고
 PUT 에 **받지 않는 `type`** 을 보낸다. 둘 다 조용히 버려진다. 이 PR 이 없애려는
 결함을 새로 만드는 것이다. 근거:
 `paths/contacts/id_addresses.yaml:21-45`, `id_addresses_id.yaml:29-45`,
@@ -681,19 +684,19 @@ free-form dict 에서 명시 파라미터로 바뀌므로 **툴 호출 계약의
 | `.github/workflows/publish.yml` | 재사용 스모크 호출, build-once-then-publish, `environment:` 게이트, 태그↔버전 검사, 액션 SHA 핀 | A-1.3, D-I |
 | `src/voipbin_mcp/client.py` | envelope 파싱 + `reason`/`request_id` 구조화 속성(`VoIPbinAPIError.__init__` 를 `(status_code, message, reason=None, request_id=None)` 로 확장, 기존 2-인자 호출 호환), **error_map 전면 재구성**, 429 + **`Retry-After` 부재 허용**, 원문 폴백 200자 절단, `VOIPBIN_API_BASE_URL`, 요청별 `Cookie` 헤더 + `VOIPBIN_AUTH_TRANSPORT` 스위치(**미인식 값은 즉시 실패**, D-P), **`import json` 섀도잉 정리**(`:3,:75,:85`) | A-2.6, A-2.7, A-5.15, D-C, D-D, D-H, D-L, D-P |
 | `src/voipbin_mcp/tools/contacts.py` | `addresses`/`tag_ids`, `source`/`external_id` 추가, **`update_contact` free-form dict → `None` sentinel 명시 파라미터 7개**(D-N), 하위 리소스 5툴(바디는 D-E 표), `addresses[].type` 을 **`tel`\|`email` 로 한정**, **`target_name` 완전 제거**(D-M1: 201 후 소실), 구 `phone_numbers`/`emails`/`fields` 를 **받아서 거부**(D-O) | A-2.4, A-2.5, D-E, D-M, D-N, D-O |
-| `src/voipbin_mcp/tools/campaigns.py` | enum 4값, 신규 4필드는 **`str\|None=None` 으로 노출**(D-O1, required 로 못박지 않음), **`update_campaign` free-form dict → `None` sentinel 명시 파라미터 5개(`actions` 제외, `service_level` 은 `int\|None`)**(D-N), **`update_campaign_actions` 툴 신설**(D-E2), 구 `fields` 받아서 거부(D-O), 모듈 요약문 | A-3.8, A-4.11, D-E, D-E2, D-G, D-N, D-O |
-| `src/voipbin_mcp/tools/ais.py` | `stt_type` 은 핸들러 기준 **5값**(`google` 포함), `engine_model` 은 값 목록이 아니라 **`<provider>.<model>` 형식 + provider 목록**(D-M3, 감사 A-3.8 의 `anthropic.*` 무효 판정 철회), write-only 서술, required `parameter` | A-3.8(개정), A-3.9, A-4.12, **D-G**, D-M3 |
+| `src/voipbin_mcp/tools/campaigns.py` | enum 4값, 신규 4필드는 **`str\|None=None` 으로 노출** + **생략 시 캠페인이 생성되나 발신하지 않음을 docstring 에 명시**(D-O1), **`update_campaign` free-form dict → `None` sentinel 명시 파라미터 5개(`actions` 제외, `service_level` 은 `int\|None`)**(D-N), **`update_campaign_actions` 툴 신설**(D-E2), 구 `fields` 받아서 거부(D-O), 모듈 요약문 | A-3.8, A-4.11, D-E, D-E2, D-G, D-N, D-O |
+| `src/voipbin_mcp/tools/ais.py` | `stt_type` 은 핸들러 기준 **4값**(cartesia, deepgram, elevenlabs, google — `ValidValues()` 가 `""` 를 제외한다), `engine_model` 은 값 목록이 아니라 **`<provider>.<model>` 형식 + provider 목록**(D-M3, 감사 A-3.8 의 `anthropic.*` 무효 판정 철회), write-only 서술, `parameter` 를 **`dict\|None=None` 으로 신규 노출**(D-O2) | A-3.8(개정), A-3.9, A-4.12, **D-G**, D-M3 |
 | `src/voipbin_mcp/tools/flows.py` | action type 2값, uuid 예시. `update_flow` 는 required 전체 교체로 이미 정직하므로 변경 없음(D-N sweep) | A-3.8, A-3.10, **D-G** |
 | `src/voipbin_mcp/tools/calls.py` | 주소 타입을 **`tel`\|`sip`\|`agent`\|`extension`** 로 열거(D-M4, 감사 A-3.10 의 "전체" 대체), source_type 은 미검증임을 명시 | A-3.10(개정), **D-G**, D-M4 |
-| `src/voipbin_mcp/tools/emails.py` | `attachments` | A-4.13, D-G |
-| `src/voipbin_mcp/tools/conferences.py` | required 전체, `type` 하드코딩 해제 → **`conference`\|`connect`**, `queue` 는 `connect` 로 정규화됨 + 서버 검증 없음을 명시(D-M5) | A-4.13, D-M5 |
+| `src/voipbin_mcp/tools/emails.py` | `attachments` 를 **`list[dict]\|None=None` 으로 신규 노출**(D-O2) | A-4.13, D-G, D-O2 |
+| `src/voipbin_mcp/tools/conferences.py` | required 전체, `type` 하드코딩 해제 → **`conference`\|`connect`**(기본값 `"conference"` 보존, D-O2), `queue` 는 `connect` 로 정규화됨 + 서버 검증 없음을 명시(D-M5), **`timeout` 을 3600000ms → 3600s 로 정정**(D-M6) | A-4.13, D-M5, D-M6, D-O2 |
 | `src/voipbin_mcp/tools/routes.py` | **"accesskey 로 사용 불가" 명시** (superadmin 전용 아님, §5.4b) | A-5.14, D-F |
 | 모든 list 툴 | page_size 1–100 명시 | A-3.10, **D-G** |
 | `tests/test_client.py` | **기존 픽스처 교정**: envelope 중첩 형태로 교체(`:62,71,91`), **accesskey URL 단언 재작성**(`:45,:56` → Cookie 헤더 존재 + URL 에 accesskey **부재**), **POST/PUT/DELETE 테스트(`:80,:100,:111`)에도 인증 단언 추가**(공유 헬퍼 `client.py:79,89,99`), base URL 기본값 단언(`:21-22`) 유지 + 환경변수 오버라이드 추가, 429(`Retry-After` 유/무 both) 테스트, `import os` 미사용 정리(`:1`) | A-2.6, A-5.15, A-5.16, D-D, D-L |
 | `tests/test_tools_contacts.py` 외 4개 | 신설 | A-5.16 |
 | `tests/data/openapi_enums.json` | **신설** (스펙에서 생성한 enum 스냅샷, §8-4) | A-5.16 |
 | `scripts/regen_openapi_enums.py` | **신설** (스냅샷 재생성 스크립트, §8-4) | A-5.16 |
-| `README.md` | 예시(새 파라미터 형태로), **격리 설치(uvx/pipx) 우선 안내 + 공유 venv 다운그레이드 경고**, Security Note, `VOIPBIN_API_BASE_URL`/`VOIPBIN_AUTH_TRANSPORT`, 지원 범위, **툴 목록 표(`README.md:69-88`)에 신규 6개 행 추가** | A-5.17, D-K |
+| `README.md` | 예시(새 파라미터 형태로), **격리 설치(uvx/pipx) 우선 안내 + 공유 venv 다운그레이드 경고**, Security Note, `VOIPBIN_API_BASE_URL`/`VOIPBIN_AUTH_TRANSPORT`, 지원 범위, **툴 목록 표(`README.md:69-88`)에 신규 6개 행 추가**, **"알려진 제약" 섹션 신설**(§3 stopping rule·D-M1 이 여기에 기재하라고 지시하나 v5 까지 둘 곳이 없었다: `target_name`, `on_complete_flow_id`, `conferences.type` 미검증, 캠페인 4필드 생략 시 미발신) | A-5.17, D-K, D-M1, D-O1 |
 | `CHANGELOG.md` | **신설** (0.2.0 파괴적 변경 + 마이그레이션 before/after 코드 + 0.3.0 에서 구 파라미터 제거 예정) | D-J, D-O |
 | `docs/RELEASING.md` | **신설** (yank + 재배포 절차) | D-J |
 
@@ -840,7 +843,7 @@ tests/test_client.py:1:8        F401  `os` imported but unused
 
 ### D-M. 유효 값의 권위는 스펙이 아니라 핸들러다
 
-**이 결함 클래스는 여섯 라운드에 걸쳐 다섯 번 나왔고, 그 중 세 번은 클래스를
+**이 결함 클래스는 여덟 라운드에 걸쳐 다섯 번 나왔고, 그 중 세 번은 클래스를
 없애려고 쓴 섹션이 재도입했다**(R3 → D-E 의 `target_name`, R5 → D-M 의
 `addresses[].type`, R7 → D-M 의 `target_name` 재발). 원인은 매번 같다.
 **스펙을 권위로 삼은 것이다.**
@@ -855,8 +858,8 @@ tests/test_client.py:1:8        F401  `os` imported but unused
 산문 규칙은 세 번 실패했으므로, 구현자는 쓰기 필드마다 다음 네 칸을 Go
 소스에서 직접 채우고 **하나라도 ✗ 면 docstring 에서 뺀다.**
 
-| 필드 | 스펙에 있나 | 게이트웨이가 읽나 | RPC 구조체가 나르나 | 핸들러가 저장하나 |
-|---|---|---|---|---|
+| 필드 | 스펙에 있나 | 게이트웨이가 읽나 | RPC 가 나르나 | 핸들러가 저장하나 | 단위·형식이 문서와 맞나 |
+|---|---|---|---|---|---|
 
 #### D-M1. 다섯 번째 인스턴스: `create_contact.addresses[].target_name`
 
@@ -943,6 +946,31 @@ v4 의 D-M 은 스펙 ⊋ 유효 한 방향만 다뤘다. 반대도 있고, §8-
 `connect` 와 구별되지 않는다.** docstring 에는 `conference` | `connect` 를
 쓰고, `queue` 는 **정규화되어 `connect` 와 동일하게 동작함**을 명시한다.
 검증이 없다는 사실도 적는다.
+
+#### D-M6. 체크리스트가 못 잡는 종류: 단위 오류 (`create_conference.timeout`)
+
+**라운드 9 가 4계층 체크리스트를 전수 적용해 여섯 번째 silent-drop 은 없음을
+확인했다**(쓰기 툴 17개 전 필드 추적). 대신 **다른 종류의 결함**을 찾았다.
+값이 정상 저장되므로 체크리스트 네 칸이 모두 ✓ 인데도 틀린 경우다.
+
+`conferences.py:38,47` 은 `timeout: int = 3600000` 을 "**milliseconds**
+(default 1 hour)" 로 문서화한다. 서버 단위는 **초**다:
+
+- `paths/conferences/id.yaml:62-67`: "Auto-termination timeout in **seconds**."
+- `conferencehandler/conference.go:83-85`: `if timeout > 0 && timeout < 60 {
+  timeout = defaultConferenceTimeout }` (`:24` = `86400`). 60 미만을 이상치로
+  보는 것 자체가 초 단위라는 증거다.
+- `conference.go:143-144`:
+  `ConferenceV1ConferenceDeleteDelay(ctx, id, res.Timeout*1000)` — **저장값에
+  1000 을 곱해 ms 로 바꾼다.** 저장 단위가 초임을 확정한다.
+
+즉 현재 기본값은 1시간이 아니라 **약 41.6일** 후 자동 종료다.
+
+→ `timeout: int = 3600` 으로 고치고 docstring 을 "**seconds**" 로 바꾼다.
+60 미만은 서버가 86400 으로 대체한다는 점도 적는다.
+
+**체크리스트에 다섯째 칸을 더한다: *단위·형식이 문서와 일치하나.***
+"저장되는가" 만 보면 단위 오류를 놓친다.
 
 ### D-N. 부분 업데이트 sentinel: `None` 기본값 + 비-None 만 전송
 
@@ -1039,12 +1067,50 @@ D-J 의 파괴적 변경 목록은 위 3개만 들었는데, **누락이 있다.
 그리고 D-O 방식으로는 덮을 수 없다. 없는 필드를 "받아서 거부" 할 수 없다.
 
 → **`str | None = None` 으로 노출하고 `None` 이면 바디에서 생략한다**(D-N 과
-동일 규칙). 서버가 `campaignhandler/campaign.go` 의 `isValidOutplanID` 계열로
-직접 검증해 **진짜 에러를 돌려주므로**, 스펙상 required 라는 사실은 서버가
-집행한다. 클라이언트에서 required 로 못박으면 이득 없이 모든 기존 호출을
-깨뜨린다. 스펙 required 라는 점은 docstring 에 명시한다.
+동일 규칙). 클라이언트에서 required 로 못박으면 이득 없이 모든 기존 호출을
+깨뜨린다.
 
-이 결정으로 0.2.0 의 hard-fail 파괴적 변경은 **0건**이 된다.
+**v5 의 근거는 틀렸다 (라운드 9).** v5 는 "서버가 `isValidOutplanID` 계열로
+직접 검증해 진짜 에러를 돌려주므로 서버가 집행한다" 고 썼다. **서버는
+집행하지 않는다.** 네 검증자 전부 nil UUID 에서 단락한다:
+
+```go
+// bin-campaign-manager/pkg/campaignhandler/campaign.go:567
+if outdialID == uuid.Nil {
+    // no outdial id has given. nothing to verify.
+    return true
+}
+```
+`:606`(outplan), `:639`(queue), `:672`(next_campaign) 동일.
+
+게이트웨이는 `PostCampaignsJSONBody` 의 **비포인터 `string`**
+(`gen.go:8626-8635`)에 `uuid.FromStringOrNil` 을 적용하므로, 생략 → `""` →
+`uuid.Nil` → **전 검증 건너뜀**이다. 결과는 outplan·outdial·queue 가 없는
+캠페인이 **201 로 생성되고 영원히 발신하지 않는 것**이다. 성공 응답 뒤의
+조용히 잘못 구성된 리소스이며, §1 과 D-O 가 없애려는 바로 그 클래스다.
+
+처방은 그대로 유지한다(hard-fail 논거는 여전히 유효). 대신 **docstring 이
+사실을 말해야 한다**: 이 네 필드를 생략하면 캠페인이 생성되지만 **실행되지
+않으며, 서버는 경고하지 않는다.** `outplan_id` 와 `outdial_id` 는 발신에
+필수이므로 docstring 에서 "사실상 필수" 로 강조한다.
+
+이 결정으로 0.2.0 의 hard-fail 파괴적 변경은 **0건**이 된다. 단 §7 이 새로
+노출하는 스펙 required 필드(`create_ai.parameter`, `send_email.attachments`,
+`create_conference.type`)에도 **같은 규칙을 적용해야** 이 수치가 성립한다
+(D-O2).
+
+#### D-O2. 새로 노출하는 스펙 required 필드도 기본값을 준다
+
+§7 은 `create_ai` 에 `parameter`, `send_email` 에 `attachments`,
+`create_conference` 에 `type` 하드코딩 해제를 지시한다. 셋 다 **현재 툴
+파라미터로 존재하지 않는다.** 구현자가 "스펙 required 니까 required 로
+선언" 하면 세 툴에서 각각 `ToolError: Field required` 가 나고, D-O1 이
+없애려는 실패를 세 번 더 만든다.
+
+→ **새로 노출하는 필드는 전부 기본값을 주고 `None` 이면 생략한다.**
+`parameter: dict | None = None`, `attachments: list[dict] | None = None`,
+`type: str = "conference"`(현재 하드코딩 값을 기본값으로 보존).
+스펙상 required 라는 사실은 docstring 에 적는다.
 
 **구 형태 호출의 0.2.0 동작을 명시한다**(v3 는 이것을 정하지 않아 구현자
 갈림 지점이었다): 구 파라미터를 **값과 함께** 넘기면 위 에러가 난다. 구
@@ -1096,3 +1162,5 @@ D-M5(`conferences`) 로 각각 처리했고, D-M 의 판정 기준을 산문에�
 | 6 | REQUEST_CHANGES | BLOCKER: 부분 업데이트 sentinel 미정 → 구현자 B 는 미지정 필드를 `""` 로 덮어써 **데이터 파괴**(`service_level=0` 문제 포함) / §3 원칙에 정지 규칙 없음 / 주간 스케줄 잡은 60일 비활동 시 자동 비활성화되어 무용 + 구현 불가. MAJOR: 0.2.0 완화책이 전부 수동적 | **D-N 신설**(`None` sentinel 확정), **§3 에 stopping rule 3조건 + 신규 툴 6개 확정** 명문화, §8-4 에서 **스케줄 잡 철회** + 한계 서술 + B 이연 근거 48커밋 기록, **D-O 신설**(구 파라미터 받아서 거부), **D-P 신설**(하한 잡 Python 3.10·3.13, `VOIPBIN_AUTH_TRANSPORT` 미인식 값 즉시 실패), 리스크표에 라이브 스모크 잔여물 행 추가 + enum 등급 정직화 |
 | 7 | REQUEST_CHANGES | BLOCKER: **다섯 번째 인스턴스** — `create_contact.addresses[].target_name` 이 201 후 소실되는데 D-M 이 광고하라고 지시(클래스를 없애려는 섹션이 **세 번째로** 재도입). 또한 D-M 근거가 사실오류(`continue` 가 아니라 게이트웨이 400). MAJOR: D-M 이 한 방향만 다룸 — `stt_type` 은 핸들러가 `google` 을 추가 허용, `engine_model` 은 prefix 검증이라 스펙 enum 이 권위 아님 / conference `type` 에 결정 없음. MINOR: `create_call` 의 `extension` 미문서화 | **D-M 전면 재작성**: 판정 권위를 스펙 → Go 소스로 명시, 산문 규칙을 **4계층 체크리스트**로 교체, **D-M1**(`target_name` 제거) **D-M2**(근거 정정) **D-M3**(유효 ⊋ 스펙 방향 + 감사 A-3.8 `anthropic.*` 판정 철회) **D-M5**(conference `conference`\|`connect`) 신설, §7 에 D-A·D-G·D-M 계열 추적 추가 |
 | 8 | REQUEST_CHANGES | BLOCKER: **D-O 근거가 정반대** — 구 인자는 검증 에러를 내지 않고 pydantic 이 조용히 버려 **빈 업데이트가 200 으로 성공**(실측). 즉 D-O 는 장식이 아니라 §4-1 결함 재생산을 막는 부품 / `create_campaign` 신규 required 4개가 파괴적 변경 목록에 없음 — **실제로 hard-fail 하는 유일한 변경** / open question 4 의 다섯 번째 인스턴스는 `calls.py` 이며 §7 이 값 집합 없이 편집을 지시. 판정: 나머지는 구현 가능, §3 stopping rule 은 실제로 구속력 있음(숫자 종료 조건) | D-O 에 **실측 결과로 근거 교체**, **D-O1 신설**(신규 4필드를 `str\|None=None` 로 노출 → hard-fail 0건), **D-M4 신설**(`tel`\|`sip`\|`agent`\|`extension`, 감사 A-3.10 "전체" 대체), open question 4 종결, 리스크표 0.2.0 행 갱신 |
+| 9 | REQUEST_CHANGES | BLOCKER: **D-O1 근거가 사실오류** — `isValidOutplanID` 계열 4개가 전부 nil UUID 에서 `return true` 로 단락(`campaign.go:567,606,639,672`)하고 게이트웨이가 비포인터 `string` 에 `FromStringOrNil` 을 쓰므로, 생략 시 검증이 **전부 건너뛰어지고** 발신 불가 캠페인이 201 로 생성됨. MAJOR: `create_conference.timeout` 이 ms 로 문서화됐으나 서버는 초(`Timeout*1000` 이 증거) → 기본값이 1시간이 아니라 41.6일. MINOR: `stt_type` 은 4값(`ValidValues()` 가 `""` 제외), README 알려진제약 섹션 미제공, §3 sweep 주장 stale, D-E 인용 dangling. **여섯 번째 silent-drop 은 없음**(쓰기 툴 17개 전 필드 4계층 추적) | D-O1 근거를 Go 실측으로 교체 + docstring 이 "생략 시 미발신" 을 말하도록 규정, **D-M6 신설**(단위 오류 = 체크리스트 5번째 칸), §7 `stt_type` 4값 정정, README 알려진제약 섹션 신설, §3 sweep 주장 재범위화, dangling 인용 정리 |
+| 10 | **APPROVE** | 라운드 8 요구 3건 전부 substance 충족 확인(pydantic 동작 독립 재현, `outgoing_call.go`/`groupcallhandler` 로 주소집합 확인). 스코프 A 는 여전히 올바르게 경계지어짐(라운드 7~10 은 표면을 **좁히기만** 했음). 오버엔지니어링 없음(스케줄 잡 철회, 잔존 항목 전부 실측 트리거 보유). **리뷰 churn 리스크가 미발견 결함 리스크를 상회**하므로 구현 착수 권고. 단 D-O1 의 "hard-fail 0건" 이 새로 노출되는 3개 required 필드에는 미적용 | **D-O2 신설**(신규 노출 required 필드도 기본값 + 생략) |
