@@ -35,7 +35,7 @@
 | API 커버리지 | 52 / 430 operation = **12.1%** | 378 operation 미노출 |
 | 리소스 커버리지 | 18 / 66 path 디렉터리 | §7 |
 | 요청 바디 정확성 | **6건 결함** (4-1, 4-3, 4-5, 4-6 두 건, 4-7) | §4 |
-| LLM 대면 docstring 정확성 | **9개 무효 enum 값 + 1건 스펙 역행 서술** | §4-4 |
+| LLM 대면 docstring 정확성 | **11개 무효 enum 값 (3개 모듈) + 1건 스펙 역행 서술** | §4-4 |
 | 클라이언트 계층 | **5건 결함** | §5 |
 | 셀프호스팅 지원 | **불가** | §5-4 |
 | 테스트 커버리지 | 18 모듈 중 16개 무테스트 + 기존 4개 중 1개는 **틀린 계약을 고정** | §6-3 |
@@ -46,7 +46,7 @@
 
 ### 3-1. `mcp` 의존성 상한 부재 (BLOCKER)
 
-`pyproject.toml:23` 은 `mcp>=1.0.0` 으로 **상한이 없다**. `mcp` 2.x 는
+`pyproject.toml:24` 는 `mcp>=1.0.0` 으로 **상한이 없다**. `mcp` 2.x 는
 `mcp.server.fastmcp` 를 제거하고 FastMCP 를 `MCPServer` 로 개명했다.
 `uv.lock` 은 1.27.0 을 고정하고 있으나, lock 은 개발 환경에만 적용되고
 `pip install voipbin-mcp` 하는 사용자에게는 적용되지 않는다.
@@ -149,21 +149,23 @@ end_handle, actions, outplan_id, outdial_id, queue_id, next_campaign_id 전체.
 뒤 4개는 파라미터로조차 존재하지 않는다. 라이브 200 이지만 outplan/outdial
 없는 캠페인은 실사용상 미완성 리소스다.
 
-### 4-4. LLM 대면 docstring 이 존재하지 않는 enum 값 9개를 지시한다 (전수 조사)
+### 4-4. LLM 대면 docstring 이 존재하지 않는 enum 값 11개를 지시한다 (전수 조사)
 
 docstring 은 LLM 이 읽는 유일한 스펙이다. 모든 툴 모듈의 docstring 에 등장하는
-값 목록을 스펙 enum 과 전수 대조했다. 결과는 campaigns 2건이 아니라 **4개 모듈
-9개 값**이다.
+값 목록을 스펙 enum 과 전수 대조했다. 결과는 campaigns 2건이 아니라 **3개 모듈
+(campaigns, ais, flows) 11개 값**이다.
 
-| 위치 | docstring 이 말하는 값 | 실제 스펙 enum | 무효 값 |
+| 위치 | docstring 이 말하는 값 | 실제 스펙 enum | 무효 값 (개수) |
 |---|---|---|---|
-| `campaigns.py:52` | call, sms, email | `CampaignManagerCampaignType` (openapi.yaml:1695-1704) = `[call, flow]` | **sms, email** (flow 는 미문서화) |
-| `campaigns.py:55` | stop, loop, next | `CampaignManagerCampaignEndHandle` (openapi.yaml:1663-1672) = `[stop, continue]` | **loop, next** (continue 는 미문서화) |
-| `ais.py:51` | openai.gpt-4o-mini, anthropic.claude-3-5-sonnet, gemini.gemini-pro-latest | `AIManagerAIEngineModel` (openapi.yaml:2017-2028) = gemini.gemini-2.5-flash / -2.5-pro / -2.0-flash / -pro-latest, openai.gpt-5.2 / 5.1 / 5 / 5-mini / 5-nano, grok.grok-3 / -3-mini | **openai.gpt-4o-mini, anthropic.claude-3-5-sonnet** (anthropic 은 제공자로 존재하지 않음). 3개 예시 중 2개 무효 |
-| `ais.py:57` | deepgram, google, azure, openai | `AIManagerAISTTType` (openapi.yaml:2959-2963) = `["", cartesia, deepgram, elevenlabs]` | **google, azure, openai**. 4개 중 3개 무효 |
-| `flows.py:43` | answer, hangup, play, record, talk, echo, ivr | `FlowManagerActionType` (openapi.yaml:4943-) 56개 값. `recording_start`/`recording_stop` 은 있으나 `record` 없음, `ivr` 없음 | **record, ivr** |
+| `campaigns.py:52` | call, sms, email | `CampaignManagerCampaignType` (openapi.yaml:1695-1704) = `[call, flow]` | **sms, email** (2). flow 는 미문서화 |
+| `campaigns.py:55` | stop, loop, next | `CampaignManagerCampaignEndHandle` (openapi.yaml:1663-1672) = `[stop, continue]` | **loop, next** (2). continue 는 미문서화 |
+| `ais.py:51` | openai.gpt-4o-mini, anthropic.claude-3-5-sonnet, gemini.gemini-pro-latest | `AIManagerAIEngineModel` (openapi.yaml:2017-2028, 11개) = gemini.gemini-2.5-flash / -2.5-pro / -2.0-flash / -pro-latest, openai.gpt-5.2 / 5.1 / 5 / 5-mini / 5-nano, grok.grok-3 / -3-mini | **openai.gpt-4o-mini, anthropic.claude-3-5-sonnet** (2). anthropic 은 제공자로 존재하지 않음. 3개 예시 중 2개 무효 |
+| `ais.py:57` | deepgram, google, azure, openai | `AIManagerAISTTType` (openapi.yaml:2959-2963) = `["", cartesia, deepgram, elevenlabs]` | **google, azure, openai** (3). 4개 중 3개 무효 |
+| `flows.py:43` | answer, hangup, play, record, talk, echo, ivr | `FlowManagerActionType` (openapi.yaml:4939, enum 4943-4983, **40개**). `recording_start`/`recording_stop` 은 있으나 `record` 없음, `ivr` 없음 | **record, ivr** (2) |
 
-`ais.py:55` 의 tts_type 4개(google, azure, elevenlabs, openai, playht)는 전수
+합계 11개.
+
+`ais.py:55` 의 tts_type 5개(google, azure, elevenlabs, openai, playht)는 전수
 확인 결과 `AIManagerAITTSType` (openapi.yaml:2908-2930, 22개) 에 모두 존재한다.
 유효하다.
 
@@ -264,8 +266,9 @@ README Security Note 가 이 점을 인정하지만, 서버는 `accesskey` **쿠
 ### 5-5. `close()` 미호출 / `validate_page_size` 묵시적 클램프
 
 `close()` 는 정의만 있고 호출되지 않는다 (stdio 프로세스 수명과 함께 종료되므로
-경미). `server.py:28-34` 는 잘못된 page_size 를 조용히 10 으로, 상한을 100 으로
-클램프하는데 어떤 툴 docstring 도 상한을 명시하지 않는다.
+경미). `server.py:28-34` 는 **정수 변환 실패 시에만** 10 으로 대체하고, 범위를
+벗어난 정수는 `max(1, min(page_size, 100))` 로 클램프한다. 즉 `page_size=0` 은
+10 이 아니라 1 이 된다. 어떤 툴 docstring 도 1–100 상한을 명시하지 않는다.
 
 *PATCH 미지원은 결함이 아니다*: `openapi/paths/**` 전체에 `patch:` 오퍼레이션이
 0건이다. 향후 항목으로만 남긴다.
@@ -332,17 +335,19 @@ README Security Note 가 이 점을 인정하지만, 서버는 `accesskey` **쿠
 
 ## 7. 커버리지 상세
 
-`openapi/paths/` 는 66개 디렉터리다. 이 중 `ws`, `me`, `auth`, `provisioning`
-등은 일반 고객 리소스가 아니다. MCP 가 다루는 것은 18개다.
+`openapi/paths/` 는 66개 디렉터리다. MCP 가 다루는 것은 18개다. 나머지 48개 중
+`ws`, `me`, `auth`, `provisioning` 4개는 일반 고객 리소스가 아니므로 의도적
+제외 대상이다.
 
-미노출 주요 리소스: mcpservers, rags, aicalls, aimessages, aisummaries,
+미노출 리소스 (44개, 전수): mcpservers, rags, aicalls, aimessages, aisummaries,
 aiaudits, aipromptproposals, speakings, transcribes, transcripts, recordings,
 recordingfiles, outdials, outplans, providers, providercalls, trunks, teams,
-webchat_widgets/sessions/messages, storage_accounts/files, timelines,
-timeline-analyses, groupcalls, queuecalls, conferencecalls, campaigncalls,
-contact_cases, contact_addresses, contact_interactions, conversation_accounts,
-accesskeys, billing_account(s), customers, available_numbers, transfers,
-outbound_config(s), 그리고 service_agents/* 전체.
+webchat_widgets, webchat_sessions, webchat_messages, storage_account,
+storage_accounts, storage_files, timelines, timeline_analyses, groupcalls,
+queuecalls, conferencecalls, campaigncalls, contact_cases, contact_addresses,
+contact_interactions, contact_peer_events, conversation_accounts, accesskeys,
+billing_account, billing_accounts, customers, available_numbers, transfers,
+outbound_config, outbound_configs, service_agents.
 
 ## 8. 진행 타당성
 
@@ -369,9 +374,17 @@ outbound_config(s), 그리고 service_agents/* 전체.
 - MCP 툴 목록은 LLM 컨텍스트를 직접 소모한다. 400+ 툴은 도구 선택 정확도를
   떨어뜨리고 일부 클라이언트의 실질 한계에 부딪힌다. "많이 노출"이 아니라
   "AI 가 실제로 쓸 것을 노출"이 정답이다.
-- superadmin 전용(`/routes`, `/customers`, `/providers`, `/trunks`,
-  `balance_*_force`)과 인증 부트스트랩(`/auth/*`)은 accesskey 로 못 쓰거나
-  써서는 안 되는 표면이다. 노출 자체가 오답이다.
+- superadmin 전용 표면은 accesskey 로 못 쓰거나 써서는 안 되므로 노출 자체가
+  오답이다. 코드로 확인한 superadmin 게이트: `/routes`
+  (`pkg/servicehandler/route.go:51,86,129,177,217,267`), `/customers`
+  (`customer.go:62,148,231,298,375,410,445,579,618`), `/providers`
+  (`provider.go:59,89,133,173,207,266`). `balance_*_force` 및 `/auth/*`
+  (인증 부트스트랩)도 제외 대상이다.
+  **`/trunks` 는 superadmin 이 아니다** — `trunk.go:43,79,117,147,208` 은
+  `PermissionCustomerAdmin|PermissionCustomerManager` 를 요구한다
+  (`grep -c PermissionProjectSuperAdmin trunk.go` = 0). SIP 트렁크 설정은
+  셀프호스팅/BYOC 고객의 핵심 리소스이므로 노출 대상이며, §9-B 우선순위에
+  포함한다.
 - `service_agents/*` 는 Agent JWT 표면이며 accesskey 계층이 아니다
   (`authenticate.go` 의 별도 bearer 경로). 별도 인증 모델이 필요하므로 이번
   스코프에서 제외한다.
@@ -391,15 +404,17 @@ outbound_config(s), 그리고 service_agents/* 전체.
 
 **A-2. 조용한 오동작 제거**
 4. `create_contact` 를 `addresses` + `tag_ids` 스펙 형태로 교정 (§4-1)
-5. `update_contact` docstring 의 허위 키 제거 + 주소/태그 하위 리소스 4개를
-   별도 툴로 노출 (§4-2)
+5. `update_contact` docstring 의 허위 키 제거 + 주소/태그 하위 리소스를
+   별도 툴로 노출. 파일 4개에 **operation 5개**다: `id_addresses.yaml` POST,
+   `id_addresses_id.yaml` PUT + DELETE, `id_tags.yaml` POST,
+   `id_tags_id.yaml` DELETE (§4-2)
 6. 에러 envelope 중첩 파싱 + `request_id` 노출 + 429/Retry-After 처리
    (§5-1, §5-2). **기존 `tests/test_client.py` 의 평평한-바디 픽스처를 실제
    중첩 형상으로 먼저 교정** (§6-3)
 7. `VOIPBIN_API_BASE_URL` 환경변수 지원 (§5-4)
 
 **A-3. docstring 전수 교정 (§4-4, §4-4b)**
-8. 무효 enum 값 9개 교정: campaigns type/end_handle, ais engine_model/stt_type,
+8. 무효 enum 값 11개 교정: campaigns type/end_handle, ais engine_model/stt_type,
    flows action types
 9. `ais.py:52-53` 의 "may appear in the response" 삭제 — 스펙은 write-only
 10. 과소 서술 교정: `calls.py` 주소 타입 전체, `campaigns.py:12` 모듈 요약문,
@@ -432,8 +447,14 @@ outbound_config(s), 그리고 service_agents/* 전체.
 - 녹취/전사: `recordings`, `recordingfiles`, `transcribes`, `transcripts`
 - 아웃바운드: `outdials`, `outplans`, campaign 하위 액션
 - 나머지: `agents`/`queues`/`tags`/`extensions`/`numbers` 쓰기 경로,
-  `conversations` 메시지, `contact_cases`, `groupcalls`, `conferences` 제어,
-  `teams`, `webchat_*`, `storage_*`, `timelines`, `billing_account`
+  `conversations` 메시지, `contact_cases`, `contact_peer_events`,
+  `groupcalls`, `conferences` 제어, `trunks` (SIP 트렁크 — 셀프호스팅/BYOC
+  핵심, superadmin 아님, §8), `teams`, `webchat_*`, `storage_*`, `timelines`,
+  `billing_account`
+
+### B-2. 낮은 우선순위 (B 에 포함하되 후순위)
+- `close()` 명시 호출 (§5-5, 경미)
+- `Development Status` 분류자를 Beta 이상으로 조정 (§6-7)
 
 ### C. 설계 단계에서 결정할 정책 사항
 - `engine_key` 취급 정책 (§4-8). A-3 의 docstring 교정과 별개로, 키를 툴
@@ -449,3 +470,4 @@ outbound_config(s), 그리고 service_agents/* 전체.
 |---|---|---|---|
 | 1 | REQUEST_CHANGES | mcp 2.x 상한 부재로 배포판 import 불가(최우선 결함 누락) / `update_contact` 처방이 오답(PUT 에 addresses 없음) / 라이브 검증 범위 과장 및 GET 집계 오류 / campaign enum 2건 미확정·미발견 / emails·conferences required 누락 미발견 / BASE_URL 하드코딩 미언급 / engine_key 보안 미분석 / 테스트 42건을 건강지표로 오용(16/18 모듈 무테스트) / 결함 개수 불일치 및 PATCH 는 비결함 / "70+ 리소스" 근거 부족 | 전면 재작성. §3-1 신설(실측 재현), §4-2 처방 교정, §3-2 에 호출/미호출 명시, §4-4·§4-6 신설, §5-4·§4-8 신설, §6-3 신설, §7 을 66 기준으로 정정, PATCH 를 비결함으로 강등 |
 | 2 | REQUEST_CHANGES | GET 집계가 여전히 틀림(list 18 → 실제 17, 싱글턴 1 누락) / docstring enum 축이 심각하게 과소집계 — campaigns 만 보고 ais·flows 를 놓쳐 무효 값이 2개가 아니라 9개 / `ais.py:52-53` 이 스펙과 정반대 서술(write-only 인데 "응답에 나타날 수 있다") / CI 가 `uv run` 의 lock 재동기화 때문에 배포 의존성 범위를 한 번도 검증하지 못함 → 핀만으로는 재발 방지 불가 / `publish.yml` 에 테스트·import 게이트 없음(깨진 배포의 직접 원인) / 기존 `test_client.py` 픽스처가 틀린 평평한 envelope 을 고정 / `create_ai` required 누락이 동일 결함 등급인데 B 로 밀림 / §5-3·§5-5·§4-7 이 어느 스코프에도 없음 / 요청 바디 결함 5 vs 6 불일치 / 커버리지 분모 자기모순 | GET 집계 정정(list 17 + by-id 17 + 싱글턴 1). §4-4 를 전수 조사 표로 전면 교체(4개 모듈 9개 무효 값 + tts 는 유효 확인 + 과소서술 3건). §4-4b 신설. §4-6·§4-7 확장(conference type 하드코딩, create_call actions/anonymous/variables, flow_id 우선 규칙). §6-3 에 기존 픽스처 결함 추가, §6-4(CI 실측 재현)·§6-5(릴리스 게이트) 신설. §6 에 clean 검증 항목 기록. §8 에 addressable-surface 분모 논의 추가. §9-A 를 A-1~A-5 19항목으로 재구성 — CI 배포검증잡·publish 게이트·create_ai required·쿠키 전송·page_size 상한 명시를 모두 A 로 승격 |
+| 3 | REQUEST_CHANGES | 두 BLOCKER 재현 성공, 수치 대부분 재검증 통과. 그러나 §4-4 무효 enum 이 9가 아니라 **11개 (3개 모듈)** — 표 자체가 11로 합산되는데 헤드라인만 9 / `FlowManagerActionType` 은 56개가 아니라 **40개** (openapi.yaml:4943-4983) / **`/trunks` 는 superadmin 이 아님** (`trunk.go:43,79,117,147,208` = CustomerAdmin\|CustomerManager, superadmin 0건) — 분모에서 잘못 제외되고 B 에도 없음 / `pyproject.toml` 은 :23 이 아니라 :24 / tts "4개" 라 쓰고 5개 나열 / contacts 하위 파일 4개는 operation 5개 / `validate_page_size` 는 범위초과를 10 이 아니라 1·100 으로 클램프 / `close()`·Beta 분류자가 어느 스코프에도 없음 / §7 목록에 contact_peer_events·storage_account 누락 | 11개/3개 모듈로 정정(표에 개수 병기), action enum 40개로 정정, §8 에 trunks 를 superadmin 아님으로 명시하고 B 에 추가, :24 로 정정, tts 5개로 정정, A-5 를 operation 5개로 명시, §5-5 클램프 동작 정확히 재서술, B-2 신설하여 close()·분류자 수용, §7 을 44개 전수 목록으로 교체 |
