@@ -474,8 +474,11 @@ README Security Note 를 함께 갱신한다.
 
 ### D-E. `create_contact` / contacts 하위 리소스 + **free-form dict 차단**
 
-`create_contact` 는 `addresses` + `tag_ids` 로 교정한다. `CommonAddress` 는
-`type`, `target`, `target_name` 등을 갖고 POST 본문은 `is_primary` 를 더한다.
+`create_contact` 는 `addresses` + `tag_ids` 로 교정한다. `addresses` 원소의
+유효 계약은 **`type`(`tel`|`email`), `target`, `name`, `detail`,
+`is_primary` 5개뿐**이다(`server/contacts.go:151-164` 가 읽는 필드 전부).
+`CommonAddress` 스펙에 있는 `target_name` 은 **보내도 201 이 나오고 저장되지
+않으므로 광고하지 않는다**(D-M1). 스펙이 아니라 게이트웨이가 권위다.
 
 `update_contact` 은 PUT 본문에 주소/태그가 **없으므로** docstring 의 허위 키만
 제거하고, 하위 리소스 5개 operation 을 새 툴로 노출한다 (§3 에서 밝힌 예외).
