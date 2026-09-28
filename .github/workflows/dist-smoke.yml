@@ -1,0 +1,110 @@
+name: dist smoke
+
+# Verifies that the built artifact actually works at BOTH ends of the declared
+# mcp range. The 0.1.1 release was importable in the lock environment and broken
+# for everyone installing from PyPI, because CI only ever tested the lock.
+on:
+  workflow_call:
+    inputs:
+      floor:
+        description: Lowest mcp version the package claims to support.
+        required: true
+        type: string
+      version:
+        description: Version of the wheel under test.
+        required: true
+        type: string
+
+jobs:
+  latest:
+    name: latest mcp in range
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Install the wheel, resolving mcp freely
+        run: |
+          pip install "dist/voipbin_mcp-${{ inputs.version }}-py3-none-any.whl[dev]"
+          python -c "from importlib.metadata import version; print('resolved mcp', version('mcp'))"
+
+      - name: Import the server
+        run: python -c "import voipbin_mcp.server, voipbin_mcp.tools"
+
+      - name: Console script resolves
+        run: |
+          python - <<'PY'
+          from importlib.metadata import entry_points
+          (ep,) = [e for e in entry_points(group="console_scripts")
+                   if e.name == "voipbin-mcp"]
+          ep.load()
+          print("entry point OK:", ep.value)
+          PY
+
+      - name: stdio runtime starts and answers initialize
+        run: python scripts/stdio_smoke.py
+
+      - run: pytest tests/ -q
+
+  floor:
+    name: floor mcp ${{ inputs.floor }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist
+
+      # The extras marker must ride ON the wheel path. Passing ".[dev]" as a
+      # separate argument makes pip see the project twice and fail with
+      # ResolutionImpossible; dropping "[dev]" installs no pytest and the test
+      # step below silently becomes a no-op, which is the failure this whole
+      # job exists to prevent. A glob cannot carry extras either.
+      - name: Install the wheel pinned to the floor
+        run: |
+          pip install "mcp==${{ inputs.floor }}" \
+            "dist/voipbin_mcp-${{ inputs.version }}-py3-none-any.whl[dev]"
+
+      - name: Assert the pin actually took
+        run: |
+          python - <<'PY'
+          import sys
+          from importlib.metadata import version
+          # Not mcp.__version__: that attribute does not exist on older
+          # releases, including the floor itself.
+          got = version("mcp")
+          want = "${{ inputs.floor }}"
+          if got != want:
+              sys.exit(f"expected mcp {want}, resolved {got}")
+          print("pinned to", got)
+          PY
+
+      - name: Import the server
+        run: python -c "import voipbin_mcp.server, voipbin_mcp.tools"
+
+      - name: stdio runtime starts and answers initialize
+        run: python scripts/stdio_smoke.py
+
+      # Must actually run. If pytest is missing this fails loudly rather than
+      # reporting a green job that tested nothing.
+      - name: Run the suite against the floor
+        run: |
+          python -c "import pytest" || {
+            echo "pytest is not installed: the [dev] extras did not install."
+            exit 1
+          }
+          pytest tests/ -q

@@ -48,9 +48,10 @@ async def create_call(
     """Create a new outbound call.
 
     Args:
-        source_type: Source address type. One of: tel, sip, agent.
+        source_type: Source address type. One of: tel, sip, agent, extension.
         source_target: Source address (e.g., "+14155551234" for tel, UUID for agent).
-        destination_type: Destination address type. One of: tel, sip, agent.
+        destination_type: Destination address type. One of: tel, sip, agent,
+            extension.
         destination_target: Destination address (e.g., "+14155555678" for tel).
         flow_id: Optional flow ID to execute when the call connects.
     """

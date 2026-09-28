@@ -5,9 +5,11 @@ from voipbin_mcp.server import mcp, get_client, format_response, validate_page_s
 
 @mcp.tool()
 async def list_routes(page_size: int = 10, page_token: str = "") -> str:
-    """List all routing rules in your VoIPbin account.
+    """List provider routing rules. Requires project superadmin permission.
 
-    Routes define how incoming calls are directed based on number, time, and other criteria.
+    Routes are a platform-level resource. A customer access key cannot read
+    them, so this tool answers 403 PERMISSION_DENIED unless your key carries
+    project superadmin permission.
 
     Args:
         page_size: Number of results per page (default 10).
@@ -23,7 +25,11 @@ async def list_routes(page_size: int = 10, page_token: str = "") -> str:
 
 @mcp.tool()
 async def get_route(route_id: str) -> str:
-    """Get details of a specific route.
+    """Get details of a specific route. Requires project superadmin permission.
+
+    Routes are a platform-level resource. A customer access key cannot read
+    them, so this tool answers 403 PERMISSION_DENIED unless your key carries
+    project superadmin permission.
 
     Args:
         route_id: The UUID of the route.

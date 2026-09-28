@@ -35,7 +35,8 @@ async def get_conference(conference_id: str) -> str:
 async def create_conference(
     name: str,
     detail: str = "",
-    timeout: int = 3600000,
+    conference_type: str = "conference",
+    timeout: int = 3600,
     pre_flow_id: str = "",
     post_flow_id: str = "",
 ) -> str:
@@ -44,13 +45,17 @@ async def create_conference(
     Args:
         name: Display name for the conference.
         detail: Description.
-        timeout: Conference timeout in milliseconds (default 1 hour).
+        conference_type: Required by the API, defaulted here. One of:
+            conference, connect. Any other value is normalised to connect by
+            the server.
+        timeout: Conference lifetime in SECONDS (default 3600, one hour).
+            Values below 60 are replaced by the server default of 86400.
         pre_flow_id: Optional flow ID to execute when a participant joins.
         post_flow_id: Optional flow ID to execute when a participant leaves.
     """
     client = get_client()
     body: dict = {
-        "type": "conference",
+        "type": conference_type,
         "name": name,
         "detail": detail,
         "timeout": timeout,

@@ -36,18 +36,33 @@ async def send_email(
     destination_email: str,
     subject: str,
     content: str,
+    attachments: list[dict] | None = None,
 ) -> str:
     """Send an email.
+
+    Attachments reference something already stored in VoIPbin rather than
+    carrying file bytes. Each entry accepts exactly two keys:
+
+      reference_type  "recording" to attach a call recording, or "" for none.
+      reference_id    UUID of the referenced object.
+
+    Example:
+        attachments=[{"reference_type": "recording", "reference_id": "<uuid>"}]
 
     Args:
         destination_email: Recipient email address.
         subject: Email subject line.
         content: Email body (HTML or plain text).
+        attachments: Required by the API, defaulted here. See the format above;
+            omit it to send an email with no attachments.
     """
     client = get_client()
-    result = await client.post("/emails", json={
+    body: dict = {
         "destinations": [{"type": "email", "target": destination_email}],
         "subject": subject,
         "content": content,
-    })
+    }
+    if attachments is not None:
+        body["attachments"] = attachments
+    result = await client.post("/emails", json=body)
     return format_response(result)

@@ -42,23 +42,36 @@ async def create_ai(
     tts_voice_id: str,
     stt_type: str,
     stt_language: str = "en-US",
+    parameter: dict | None = None,
 ) -> str:
     """Create a new AI voice agent.
+
+    Provider lists change as vendors are added, so the values below are
+    examples rather than the complete set. An unsupported value is rejected
+    with a 400 naming the field.
 
     Args:
         name: AI agent name.
         detail: Description.
-        engine_model: LLM model (e.g., "openai.gpt-4o-mini", "anthropic.claude-3-5-sonnet", "gemini.gemini-pro-latest").
-        engine_key: API key for the LLM provider. This is a sensitive credential
-            that will be sent to the VoIPbin API and may appear in the response.
+        engine_model: LLM model as "<vendor>.<model>". The vendor prefix is
+            what the server validates, so new models from a supported vendor
+            work without a release here. Examples: "openai.gpt-4o-mini",
+            "anthropic.claude-3-5-sonnet", "gemini.gemini-pro-latest".
+        engine_key: Reference to the API key for the LLM provider. Pass an
+            environment variable reference rather than a literal key; the value
+            is sent to the VoIPbin API and may appear in responses and logs.
         init_prompt: System prompt for the AI agent.
-        tts_type: Text-to-speech provider: "google", "azure", "elevenlabs", "openai", "playht".
+        tts_type: Text-to-speech provider. Examples: google, azure, openai,
+            elevenlabs, cartesia, deepgram.
         tts_voice_id: Voice ID for TTS (e.g., "en-US-Standard-A" for Google).
-        stt_type: Speech-to-text provider: "deepgram", "google", "azure", "openai".
+        stt_type: Speech-to-text provider. Examples: google, deepgram,
+            cartesia, elevenlabs.
         stt_language: Language code in BCP-47 format (default "en-US").
+        parameter: Required by the API, defaulted here. Engine-specific tuning
+            options; omit it to use the engine defaults.
     """
     client = get_client()
-    result = await client.post("/ais", json={
+    body: dict = {
         "name": name,
         "detail": detail,
         "engine_model": engine_model,
@@ -68,5 +81,8 @@ async def create_ai(
         "tts_voice_id": tts_voice_id,
         "stt_type": stt_type,
         "stt_language": stt_language,
-    })
+    }
+    if parameter is not None:
+        body["parameter"] = parameter
+    result = await client.post("/ais", json=body)
     return format_response(result)

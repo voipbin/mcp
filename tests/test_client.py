@@ -1,4 +1,3 @@
-import os
 import pytest
 import httpx
 import respx
@@ -37,12 +36,14 @@ class TestClientGet:
 
     @respx.mock
     @pytest.mark.asyncio
-    async def test_get_appends_accesskey(self, client):
+    async def test_get_sends_key_as_cookie_not_query(self, client):
         route = respx.get("https://api.voipbin.net/v1.0/calls").mock(
             return_value=httpx.Response(200, json={"result": []})
         )
         await client.get("/calls")
-        assert "accesskey=test-key-123" in str(route.calls[0].request.url)
+        request = route.calls[0].request
+        assert request.headers["Cookie"] == "accesskey=test-key-123"
+        assert "accesskey" not in str(request.url)
 
     @respx.mock
     @pytest.mark.asyncio
@@ -51,24 +52,30 @@ class TestClientGet:
             return_value=httpx.Response(200, json={"result": []})
         )
         await client.get("/calls", params={"page_size": 10})
-        url = str(route.calls[0].request.url)
-        assert "page_size=10" in url
-        assert "accesskey=test-key-123" in url
+        request = route.calls[0].request
+        assert "page_size=10" in str(request.url)
+        assert "accesskey" not in str(request.url)
+        assert request.headers["Cookie"] == "accesskey=test-key-123"
 
     @respx.mock
     @pytest.mark.asyncio
     async def test_get_401_raises(self, client):
         respx.get("https://api.voipbin.net/v1.0/calls").mock(
-            return_value=httpx.Response(401, json={"message": "unauthorized"})
+            return_value=httpx.Response(
+                401,
+                json={"error": {"message": "unauthorized", "reason": "AUTH_FAILED"}},
+            )
         )
-        with pytest.raises(VoIPbinAPIError, match="Invalid or expired API key"):
+        with pytest.raises(VoIPbinAPIError, match="AUTH_FAILED"):
             await client.get("/calls")
 
     @respx.mock
     @pytest.mark.asyncio
     async def test_get_404_raises(self, client):
         respx.get("https://api.voipbin.net/v1.0/calls/bad-id").mock(
-            return_value=httpx.Response(404, json={"message": "not found"})
+            return_value=httpx.Response(
+                404, json={"error": {"message": "not found"}}
+            )
         )
         with pytest.raises(VoIPbinAPIError, match="not found"):
             await client.get("/calls/bad-id")
@@ -88,9 +95,11 @@ class TestClientPost:
     @pytest.mark.asyncio
     async def test_post_402_raises(self, client):
         respx.post("https://api.voipbin.net/v1.0/calls").mock(
-            return_value=httpx.Response(402, json={"message": "insufficient credits"})
+            return_value=httpx.Response(
+                402, json={"error": {"message": "insufficient credits"}}
+            )
         )
-        with pytest.raises(VoIPbinAPIError, match="Insufficient credits"):
+        with pytest.raises(VoIPbinAPIError, match="insufficient credits"):
             await client.post("/calls", json={})
 
 
