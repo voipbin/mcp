@@ -117,15 +117,23 @@ def main() -> int:
     def drain_stderr():
         stream = proc.stderr
         assert stream is not None
-        # Incremental, but in BLOCKS. EOF arrives only when EVERY holder of the
-        # write end closes it, so a forked worker inheriting stderr would keep a
-        # single read()-to-EOF blocked forever and the traceback would be lost.
-        # Reading one byte at a time fixes that but is ~20x slower, which
-        # back-pressures a verbose child: it cannot finish writing inside the
-        # grace window below, gets signalled mid-write, and its traceback is
-        # again never drained. Blocks keep both properties.
-        for chunk in iter(lambda: stream.read(65536), ""):
-            stderr_chunks.append(chunk)
+        # Incremental, in BLOCKS, on the RAW buffer. Three traps in one line:
+        #
+        #  - A single read()-to-EOF never returns while any holder of the write
+        #    end (a forked worker) keeps it open, so the traceback is lost.
+        #  - Reading one byte at a time fixes that but is ~20x slower, which
+        #    back-pressures a verbose child until it is signalled mid-write.
+        #  - TextIOWrapper.read(n) is NOT a block read: it loops until it has n
+        #    CHARS or EOF. With EOF withheld by a worker, a short traceback (a
+        #    real one is a few hundred bytes) is invisible. read1 returns what
+        #    is already buffered, which is what we actually want.
+        raw = getattr(stream, "buffer", None)
+        if raw is None:  # pragma: no cover - text mode always has .buffer
+            for chunk in iter(lambda: stream.read(1), ""):
+                stderr_chunks.append(chunk)
+            return
+        for block in iter(lambda: raw.read1(65536), b""):
+            stderr_chunks.append(block.decode("utf-8", "replace"))
 
     stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
     stderr_thread.start()
@@ -186,14 +194,37 @@ def main() -> int:
         # The gate targets the 0.1.x shape (dies on first contact), which is
         # well inside the window; later crashes are left to the test suite.
         timer.cancel()
+
+        # Sampled while stdin is STILL OPEN: a server that exits here quit on us
+        # mid-session. Once stdin closes, exiting is the correct response to EOF
+        # and says nothing about health, so this is the only window in which a
+        # self-chosen exit is evidence of anything.
+        #
+        # The window has to be a WAIT, not a bare poll(). Polling the instant
+        # the answer arrives returns None even for a server that called
+        # os._exit(0) in the same breath, because it has not been reaped yet --
+        # measured: bare poll() let `exit_zero_silently` pass. The 2s bound
+        # documented above is spent here, with stdin held open, so it costs a
+        # healthy server nothing extra.
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        exited_before_shutdown = proc.poll()
+
         try:
             if proc.stdin is not None:
                 proc.stdin.close()
         except BrokenPipeError:
             pass
 
+        # A server still alive here has seen EOF. It gets a SHORT moment to act
+        # on it: the 2s crash window above was already spent with stdin open, so
+        # repeating it here doubled every healthy run (2.3s -> 4.1s measured) to
+        # detect nothing new -- a server that reaches this point has already
+        # proven it survived being talked to.
         try:
-            proc.wait(timeout=2)
+            proc.wait(timeout=0.3)
         except subprocess.TimeoutExpired:
             pass
 
@@ -235,12 +266,32 @@ def main() -> int:
 
     # A server that answers and then dies is broken for any client that holds
     # the session open -- and not every death prints a traceback (os._exit, a
-    # segfault, a C-level abort). Negative statuses are our own SIGTERM/SIGKILL.
+    # segfault, a C-level abort), so the traceback check above is not enough.
+    #
+    # The obvious next check, "it exited on its own, therefore it is broken",
+    # is WRONG and was measured to be wrong: closing stdin is itself a request
+    # to stop, and a correct stdio server responds to EOF by exiting 0. The real
+    # server did exactly that and the gate failed all 15 runs.
+    #
+    # So the question is narrower: did it quit BEFORE we closed stdin? That is
+    # the moment recorded in `exited_before_shutdown`, sampled while stdin was
+    # still open. Everything after that point is a legitimate shutdown, where
+    # only a NON-zero status is a complaint.
+    if exited_before_shutdown is not None:
+        sys.stderr.write(
+            f"server exited on its own with status {exited_before_shutdown} "
+            "after answering, while the session was still open. It completed "
+            "the handshake and then quit, which breaks any client holding the "
+            "session open.\n"
+        )
+        if stderr_text:
+            sys.stderr.write(f"stderr: {stderr_text[:2000]}\n")
+        return 1
+
     if exit_status not in (None, 0, -signal.SIGTERM, -signal.SIGKILL):
         sys.stderr.write(
-            f"server exited with status {exit_status} after answering. It "
-            "completed the handshake and then died, which breaks any client "
-            "holding the session open.\n"
+            f"server exited with status {exit_status} on shutdown, which is "
+            "not a clean exit.\n"
         )
         if stderr_text:
             sys.stderr.write(f"stderr: {stderr_text[:2000]}\n")

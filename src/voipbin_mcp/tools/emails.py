@@ -50,12 +50,15 @@ async def send_email(
         attachments=[{"reference_type": "recording", "reference_id": "<uuid>"}]
 
     Attachments are resolved AFTER the API has answered success: the send runs
-    in the background, and an attachment that cannot be resolved (an
-    unsupported reference_type, or a reference_id that does not exist) is logged
-    and skipped. The email is still delivered, without it. So a success response
-    here confirms the email was accepted, never that an attachment was
-    included. To send with no attachments, omit this argument entirely rather
-    than passing a placeholder entry.
+    in the background, so nothing about an attachment is reported back. What
+    happens to an unresolvable attachment (an unsupported reference_type, or a
+    reference_id that does not exist) depends on which provider handles the
+    message. The primary logs it and sends the email without it; the fallback,
+    used when the primary fails, treats it as an error and sends NOTHING. So a
+    success response here confirms only that the email was accepted, never that
+    an attachment was included, and never that the email went out at all. To
+    send with no attachments, omit this argument entirely rather than passing a
+    placeholder entry.
 
     Args:
         destination_email: Recipient email address.

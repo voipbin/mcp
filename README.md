@@ -173,6 +173,18 @@ uv build
 uv run python scripts/stdio_smoke.py
 ```
 
+Tool descriptions are pinned by exact text in `tests/golden_docstrings.json`,
+so any docstring edit fails the suite until the golden file is regenerated.
+That is intentional: ten documented behaviours in this package turned out to
+contradict the backend, so an edit is the moment to re-read the Go source named
+beside the claim in `PINNED_CLAIMS` and confirm it still holds. Once verified:
+
+```bash
+# optional but recommended: check every pinned Go reference still resolves
+VOIPBIN_MONOREPO=/path/to/monorepo uv run pytest tests/ -k resolve
+uv run python scripts/update_golden_docstrings.py
+```
+
 ## License
 
 MIT

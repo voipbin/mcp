@@ -4,6 +4,11 @@ Covers the None sentinel for partial updates, the active rejection of the
 0.1.x parameters, and the unit corrections.
 """
 
+import importlib
+import json
+import os
+import pathlib
+import pkgutil
 import re
 from pathlib import Path
 
@@ -89,14 +94,20 @@ PINNED_CLAIMS: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "emails.send_email",
-        "emailhandler/email.go:65 (go h.Send); engine_sendgrid.go:74-81,135",
+        "emailhandler/email.go:65 (go h.Send); send.go:16-22,42 (sendgrid then "
+        "mailgun); engine_sendgrid.go:75-79 (logs and continues) vs "
+        "engine_mailgun.go:79-82 (returns an error, aborting the send)",
         "Attachments are resolved AFTER the API has answered success: the send "
-        "runs in the background, and an attachment that cannot be resolved (an "
-        "unsupported reference_type, or a reference_id that does not exist) is "
-        "logged and skipped. The email is still delivered, without it. So a "
-        "success response here confirms the email was accepted, never that an "
-        "attachment was included. To send with no attachments, omit this "
-        "argument entirely rather than passing a placeholder entry.",
+        "runs in the background, so nothing about an attachment is reported "
+        "back. What happens to an unresolvable attachment (an unsupported "
+        "reference_type, or a reference_id that does not exist) depends on "
+        "which provider handles the message. The primary logs it and sends the "
+        "email without it; the fallback, used when the primary fails, treats "
+        "it as an error and sends NOTHING. So a success response here confirms "
+        "only that the email was accepted, never that an attachment was "
+        "included, and never that the email went out at all. To send with no "
+        "attachments, omit this argument entirely rather than passing a "
+        "placeholder entry.",
     ),
     (
         "ais.create_ai",
@@ -407,14 +418,17 @@ class TestDocumentedBehaviourMatchesTheBackend:
 
     def test_send_email_warns_attachments_resolve_after_the_response(self):
         # emailhandler/email.go:65 is `go h.Send(...)`, so the 201 precedes any
-        # attachment resolution, and engine_sendgrid.go:75-79 logs and continues
-        # when getAttachment fails. Its default branch rejects "".
+        # attachment resolution. The outcome is PROVIDER-DEPENDENT:
+        # emailhandler/send.go:16-22 tries sendgrid then mailgun;
+        # engine_sendgrid.go:75-79 logs and continues on a failed attachment,
+        # but engine_mailgun.go:79-82 returns an error, aborting the whole send,
+        # after which send.go:42 only logs "all email providers failed".
         doc = assert_claim(
             send_email.__doc__,
             says=(
                 'must be "recording"',
                 "resolved after the api has answered success",
-                "still delivered",
+                "sends nothing",
             ),
             never=(
                 "does confirm the attachment",
@@ -1120,4 +1134,224 @@ class TestPinnedClaims:
             f"new Args entry, which is how a claim gets scoped away:\n\n"
             f"  ...{claim[-60:]}\n  >>> {tail[:200]}\n\n"
             f"Verified against: {go_ref}"
+        )
+
+
+GOLDEN_PATH = pathlib.Path(__file__).parent / "golden_docstrings.json"
+
+
+class TestGoldenDocstrings:
+    """Every tool description is pinned WHOLE, by exact equality.
+
+    Three narrower designs were each defeated by a reviewer, and each failed the
+    same way: they asked whether some approved text was PRESENT.
+
+      1. keyword assertions -- "500" in doc plus "do not retry it unchanged"
+         both held while the docstring said 500 is transient, retry it.
+      2. position-independent phrase checks -- defeated by moving a term into a
+         list where it no longer applied, and by a claim occurring twice so
+         reversing one site left the other to satisfy the check.
+      3. says=/never= tuples -- defeated by APPENDING a scope ("that applied to
+         the 0.1.x gateway only"), and after the terminator was tightened, by
+         PREPENDING one ("ignore the sentence below, retained for history").
+
+    Containment cannot pin direction, because text is not closed under
+    insertion: whatever is required to be present stays present when a reversal
+    is written around it. Exact equality is closed under insertion anywhere, so
+    it is the only check that cannot be worked around by adding words.
+
+    The cost is deliberate: any docstring edit, even an honest typo fix, fails
+    here until the golden file is regenerated. That is the point. Ten docstring
+    claims have been found FALSE against the Go source, so regenerating is
+    exactly the moment to re-read the Go code named in PINNED_CLAIMS and confirm
+    the behaviour still holds.
+
+    Regenerate with:
+        python scripts/update_golden_docstrings.py
+    """
+
+    @staticmethod
+    def _golden() -> dict[str, str]:
+        return json.loads(GOLDEN_PATH.read_text())
+
+    @pytest.mark.asyncio
+    async def test_no_tool_description_has_drifted(self):
+        golden = self._golden()
+        live = {t.name: " ".join((t.description or "").split()) for t in await mcp.list_tools()}
+        drifted = {
+            name: (golden[name], live[name])
+            for name in sorted(set(golden) & set(live))
+            if golden[name] != live[name]
+        }
+        assert not drifted, (
+            "Tool description(s) changed:\n"
+            + "\n\n".join(
+                f"--- {name}\nGOLDEN: {g}\nLIVE:   {live_text}"
+                for name, (g, live_text) in drifted.items()
+            )
+            + "\n\nIf the new text is correct, re-read the Go source named beside "
+            "this claim in PINNED_CLAIMS, confirm it still says what the docstring "
+            "says, then run scripts/update_golden_docstrings.py."
+        )
+
+    @pytest.mark.asyncio
+    async def test_golden_covers_exactly_the_registered_tools(self):
+        """A pin nobody notices is missing protects nothing.
+
+        A reviewer retargeted one pin to a second tool, leaving the first with
+        zero coverage and the table with a duplicate, and nothing failed.
+        """
+        golden = set(self._golden())
+        live = {t.name for t in await mcp.list_tools()}
+        assert golden == live, (
+            f"missing from golden: {sorted(live - golden)}; "
+            f"stale in golden: {sorted(golden - live)}"
+        )
+
+    def test_every_pinned_claim_names_a_registered_tool(self):
+        """Guards against a pin drifting onto a tool that no longer exists."""
+        for accessor, _ref, _claim in PINNED_CLAIMS:
+            assert _resolve(accessor) is not None, accessor
+
+    def test_pinned_claims_have_no_duplicate_targets_for_one_claim(self):
+        seen: dict[tuple[str, str], int] = {}
+        for accessor, _ref, claim in PINNED_CLAIMS:
+            key = (accessor, claim)
+            seen[key] = seen.get(key, 0) + 1
+        dupes = [k for k, n in seen.items() if n > 1]
+        assert not dupes, f"duplicate pins: {dupes}"
+
+    def test_the_set_of_pinned_tools_is_itself_pinned(self):
+        """Retargeting a pin must not silently un-cover a tool.
+
+        A reviewer pointed one pin at a sibling tool, which left the original
+        with zero coverage while the table still looked full. Keying the
+        duplicate check on (accessor, claim) does not catch that, because the
+        retargeted entry is a new accessor with a new claim. The set of covered
+        tools is therefore pinned too.
+        """
+        # Tool -> how many distinct claims are pinned on it. Counting matters:
+        # several tools legitimately carry two pins, so a set alone would let a
+        # pin move from a two-pin tool onto a one-pin tool unnoticed.
+        expected = {
+            "ais.create_ai": 2,
+            "campaigns.create_campaign": 2,
+            "conferences.create_conference": 2,
+            "contacts.create_contact": 1,
+            "emails.send_email": 1,
+            "flows.create_flow": 1,
+            "routes.list_routes": 1,
+        }
+        actual: dict[str, int] = {}
+        for accessor, _ref, _claim in PINNED_CLAIMS:
+            actual[accessor] = actual.get(accessor, 0) + 1
+        assert actual == expected, (
+            f"pin coverage changed.\nexpected: {expected}\nactual:   {actual}\n"
+            "Adding a pin is good, but update this mapping deliberately so a "
+            "RETARGETED pin cannot pass as a new one."
+        )
+
+    def test_every_go_reference_looks_like_a_real_source_location(self):
+        """A reference nobody reads is decoration.
+
+        A reviewer swapped a pin's reference for `nonexistent.go:9999` and
+        nothing failed. The monorepo is not available in CI, so its contents
+        cannot be checked here; what is enforced is the shape, plus the service
+        directory being one that actually exists in the platform.
+        """
+        known_services = {
+            "bin-ai-manager",
+            "bin-api-manager",
+            "bin-campaign-manager",
+            "bin-common-handler",
+            "bin-conference-manager",
+            "bin-contact-manager",
+            "bin-email-manager",
+            "bin-flow-manager",
+        }
+        for accessor, ref, _claim in PINNED_CLAIMS:
+            assert re.search(r"\.go:\d+", ref), (
+                f"{accessor}: reference must name a Go file and line, got {ref!r}"
+            )
+            for service in re.findall(r"(bin-[a-z-]+)/", ref):
+                assert service in known_services, (
+                    f"{accessor}: unknown service {service!r} in reference {ref!r}"
+                )
+
+    @pytest.mark.skipif(
+        not os.environ.get("VOIPBIN_MONOREPO"),
+        reason="set VOIPBIN_MONOREPO=/path/to/monorepo to verify pin references resolve",
+    )
+    def test_go_references_resolve_in_the_monorepo(self):
+        """Opt-in: prove each pin's Go file actually exists.
+
+        CI has no monorepo checkout, and the shape check above cannot tell a
+        real filename from a plausible one inside a real service directory (a
+        reviewer swapped in `nonexistent.go:9999` and the shape check passed).
+        Run this locally before regenerating the golden file:
+
+            VOIPBIN_MONOREPO=~/gitvoipbin/monorepo pytest tests/ -k resolve
+        """
+        root = pathlib.Path(os.environ["VOIPBIN_MONOREPO"])
+        missing = []
+        for accessor, ref, _claim in PINNED_CLAIMS:
+            for rel in re.findall(r"([\w./-]+\.go)", ref):
+                name = rel.split("/")[-1]
+                if (root / rel).exists():
+                    continue
+                if any(True for _ in root.rglob(name)):
+                    continue
+                missing.append(f"{accessor}: {rel}")
+        assert not missing, f"pin references that resolve to nothing: {missing}"
+
+
+
+class TestPageSizeIsAlwaysClamped:
+    """Every paginated tool must route page_size through validate_page_size.
+
+    A reviewer removed the clamp from one list tool and the whole suite stayed
+    green, because no test tied a list tool to the clamp. Rather than add one
+    test per tool and leave the next one uncovered, this walks the source: any
+    tool taking a page_size argument must pass it through the validator.
+    """
+
+    def test_no_list_tool_sends_page_size_unclamped(self):
+        import inspect
+
+        import voipbin_mcp.tools as tools_pkg
+
+        # Walk the package's real modules. Reading __all__ would have made this
+        # test vacuous: the package does not define one, so the loop body never
+        # ran and the test passed while examining nothing.
+        module_names = [m.name for m in pkgutil.iter_modules(tools_pkg.__path__)]
+        assert len(module_names) >= 9, (
+            f"expected the tool modules to be discoverable, found {module_names}"
+        )
+
+        checked = 0
+        offenders = []
+        for module_name in module_names:
+            module = importlib.import_module(f"voipbin_mcp.tools.{module_name}")
+            for name, fn in vars(module).items():
+                target = getattr(fn, "__wrapped__", fn)
+                if not callable(target) or not hasattr(target, "__code__"):
+                    continue
+                if target.__module__ != module.__name__:
+                    continue
+                try:
+                    params = inspect.signature(target).parameters
+                except (TypeError, ValueError):  # pragma: no cover
+                    continue
+                if "page_size" not in params:
+                    continue
+                checked += 1
+                src = inspect.getsource(target)
+                if "validate_page_size(page_size)" not in src:
+                    offenders.append(f"{module_name}.{name}")
+        # Without this the test would pass if the signature walk silently
+        # matched nothing, which is exactly how the first version of it broke.
+        assert checked >= 15, f"only inspected {checked} paginated tools"
+        assert not offenders, (
+            "these tools accept page_size but do not clamp it: "
+            f"{sorted(offenders)}"
         )

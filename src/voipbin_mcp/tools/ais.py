@@ -71,8 +71,15 @@ async def create_ai(
         stt_type: Speech-to-text provider. Examples: google, deepgram,
             cartesia, elevenlabs.
         stt_language: Language code in BCP-47 format (default "en-US").
-        parameter: Required by the API, defaulted here. Engine-specific tuning
-            options; omit it to use the engine defaults.
+        parameter: Required by the API, defaulted here. NOT engine tuning,
+            despite the name: the dict is serialised to JSON and appended to the
+            agent's SYSTEM PROMPT as an extra message, alongside init_prompt. It
+            reaches the model as prose the model reads, not as knobs the engine
+            applies, so no key here changes temperature, sampling or any engine
+            setting. Keys are also carried to the realtime voice runtime, where
+            nothing consumes them. Put instructions in init_prompt and leave
+            this empty unless you deliberately want extra JSON context in the
+            prompt.
     """
     client = get_client()
     body: dict = {

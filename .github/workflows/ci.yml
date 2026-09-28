@@ -32,6 +32,21 @@ jobs:
       - run: uv pip install -e ".[dev]"
       - run: uv run pytest tests/ -v
 
+  # The smoke gate was rewritten six times, and every rewrite but the last
+  # shipped a fresh way to report a dead server as healthy. Each defect was
+  # found by a human one round after the previous fix, because the fakes that
+  # proved the fix lived in a scratch directory and were thrown away. This job
+  # is those fakes. It asserts both directions: a dead server must be caught,
+  # and a healthy one must not be failed.
+  fault-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+      - run: uv venv --python 3.13
+      - run: uv pip install -e ".[dev]"
+      - run: uv run python scripts/fault_matrix.py
+
   build:
     runs-on: ubuntu-latest
     outputs:

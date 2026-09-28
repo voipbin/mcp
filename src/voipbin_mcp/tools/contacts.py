@@ -60,10 +60,12 @@ async def create_contact(
     Addresses are how a contact is reached. Each entry accepts exactly these
     keys; anything else is ignored by the server:
 
-      type       Required. Either "tel" or "email". Any other value is
-                 rejected with a 400 by the API gateway, which is the only
-                 layer that checks: contact-manager itself would log the
-                 address and skip it, leaving the contact created without it.
+      type       Required. Either "tel" or "email". On THIS tool any other
+                 value is rejected with a 400 by the API gateway; contact-
+                 manager, the layer behind it, would log the address and skip
+                 it, leaving the contact created without it. add_contact_address
+                 behaves differently: contact-manager validates there itself and
+                 also accepts "web_session".
       target     Required. The phone number (E.164) or email address.
       name       Optional label for this address.
       detail     Optional free-text detail.
@@ -259,10 +261,13 @@ async def update_contact_address(
 
     Only the arguments you pass are sent.
 
-    Two limitations, both enforced by the API rather than by this tool:
-    the address type cannot be changed, and the name and detail labels cannot
-    be changed either. To change any of those, delete the address and add it
-    again with add_contact_address.
+    Two limitations. The address type cannot be changed. The name and detail
+    labels cannot either, and the way they fail matters: the API gateway accepts
+    them and forwards them, but the layer behind it copies only target and
+    is_primary, so a name or detail sent here is DROPPED with a success
+    response. Nothing reports the loss. This tool therefore does not accept
+    them at all, rather than letting them look like they worked. To change any
+    of those, delete the address and add it again with add_contact_address.
 
     Args:
         contact_id: The UUID of the contact.
