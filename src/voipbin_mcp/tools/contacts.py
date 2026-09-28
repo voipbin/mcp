@@ -61,7 +61,9 @@ async def create_contact(
     keys; anything else is ignored by the server:
 
       type       Required. Either "tel" or "email". Any other value is
-                 rejected with a 400.
+                 rejected with a 400 by the API gateway, which is the only
+                 layer that checks: contact-manager itself would log the
+                 address and skip it, leaving the contact created without it.
       target     Required. The phone number (E.164) or email address.
       name       Optional label for this address.
       detail     Optional free-text detail.

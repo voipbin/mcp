@@ -35,6 +35,124 @@ from voipbin_mcp.server import mcp
 
 
 
+# Claims that carry a verified Go fact are pinned by EXACT TEXT, not by keyword.
+#
+# Three earlier designs failed the same way. Asserting that a phrase is present
+# (and some reversal absent) can only ban wording the author already imagined,
+# and a reviewer produced a fresh evasion every round: text that keeps every
+# pinned phrase, avoids every banned phrase, and still tells the reader the
+# opposite of the truth by APPENDING a scope ("that applied to 0.1.x only"),
+# a qualifier ("except when the engine is a hosted vendor"), or a retraction
+# ("the gate is disabled on production deployments").
+#
+# Exact-text pinning is closed under text nobody anticipated: any edit to a
+# claim-bearing region fails, additive or subtractive. The cost is intentional
+# -- rewording a claim requires re-checking it against the Go source named
+# beside it and updating the pin deliberately.
+#
+# Each entry: (accessor, go_source_reference, exact normalised claim text).
+PINNED_CLAIMS: tuple[tuple[str, str, str], ...] = (
+    (
+        "conferences.create_conference",
+        "bin-conference-manager/pkg/conferencehandler/conference.go:83-84,24",
+        "timeout: Conference lifetime in SECONDS (default 3600, one hour). 0 "
+        "means the conference is never auto-deleted. Any other value below 60 "
+        "is replaced by the server default of 86400.",
+    ),
+    (
+        "conferences.create_conference",
+        "conference.go:110 writes it; no reader outside webhook/filter",
+        "post_flow_id: Stored but NOT executed. The field is accepted and "
+        "persisted, and the API answers success, but no code path runs it when "
+        "a participant leaves. Do not rely on it for cleanup work. "
+        "(pre_flow_id, by contrast, is genuinely executed on join.)",
+    ),
+    (
+        "campaigns.create_campaign",
+        "bin-campaign-manager/pkg/campaignhandler/execute.go:71-84",
+        "next_campaign_id: Stored and validated, but NOT acted on. When a "
+        "campaign runs out of targets the server branches only on end_handle "
+        "(stop, or re-execute after 5s); nothing starts the campaign named "
+        "here. Chain campaigns yourself instead of relying on this field.",
+    ),
+    (
+        "campaigns.create_campaign",
+        "execute.go:379-382 (nil queue => dialable), :403, :405",
+        "queue_id behaves differently, and not the way it reads. It is where "
+        "answered calls are delivered, and passing it ENABLES a pacing gate: "
+        "the server then only dials while available_agents * service_level / "
+        "100 > calls_already_dialing, using integer division. Omitting "
+        "queue_id skips that check entirely. So a queued campaign needs "
+        "available_agents * service_level >= 100 before it dials at all, which "
+        "the default service_level of 0 never satisfies, and neither does one "
+        "available agent at service_level 50.",
+    ),
+    (
+        "emails.send_email",
+        "emailhandler/email.go:65 (go h.Send); engine_sendgrid.go:74-81,135",
+        "Attachments are resolved AFTER the API has answered success: the send "
+        "runs in the background, and an attachment that cannot be resolved (an "
+        "unsupported reference_type, or a reference_id that does not exist) is "
+        "logged and skipped. The email is still delivered, without it. So a "
+        "success response here confirms the email was accepted, never that an "
+        "attachment was included. To send with no attachments, omit this "
+        "argument entirely rather than passing a placeholder entry.",
+    ),
+    (
+        "ais.create_ai",
+        "aihandler/chatbot.go:41,56,62 -> listenhandler/main.go:198 (500)",
+        "An unsupported engine_model, tts_type or stt_type comes back as a 500 "
+        "INTERNAL error with no indication of which field was wrong, so treat "
+        "a 500 from this tool as a rejected argument rather than a transient "
+        "fault, and do not retry it unchanged.",
+    ),
+    (
+        "ais.create_ai",
+        "aihandler/db.go:71 stores verbatim; no expansion anywhere",
+        "engine_key: API key for the LLM provider, stored and transmitted "
+        "verbatim. Nothing expands environment-variable references, so passing "
+        '"$OPENAI_API_KEY" sends that literal string to the provider and the '
+        "agent fails to authenticate. The value is returned in API responses "
+        "and appears in server logs, so treat it as exposed.",
+    ),
+    (
+        "flows.create_flow",
+        "bin-flow-manager/models/flow/flow.go:47 vs models/action/action.go; actionhandler/action.go:22-37",
+        'Note that "transfer" is a FLOW type, not an action type, and is '
+        "rejected here. An unsupported type is rejected with a 400 naming the "
+        "action; consult the VoIPbin API documentation for the full list and "
+        "each type's option schema.",
+    ),
+    (
+        "contacts.create_contact",
+        "bin-contact-manager/pkg/contacthandler/contact.go:70-71; gen.go Valid() has no caller",
+        "source: Where the contact came from. The values the platform uses are "
+        "manual, import, api and sync, but no layer validates this field, so "
+        "an unrecognised string is stored as given. Omit it to get manual.",
+    ),
+    (
+        "routes.list_routes",
+        "bin-api-manager/pkg/servicehandler/route.go:51,86,129; error_translate.go:81-82",
+        "Requires project superadmin permission. Routes are a platform-level "
+        "resource. A customer access key cannot read them, so this tool "
+        "answers 403 PERMISSION_DENIED unless your key carries project "
+        "superadmin permission.",
+    ),
+)
+
+
+def _resolve(accessor: str):
+    import importlib
+
+    module_name, attr = accessor.split(".")
+    module = importlib.import_module(f"voipbin_mcp.tools.{module_name}")
+    return getattr(module, attr)
+
+
+def normalised_doc(fn) -> str:
+    return " ".join((fn.__doc__ or "").split())
+
+
 # A claim is pinned by its DIRECTION, not its keywords. Three times running, a
 # mutant kept every pinned token and appended a contradiction ("...is a myth",
 # "on current production it IS executed"), so each guard below names the
@@ -941,3 +1059,58 @@ class TestServerIdentity:
         assert server.mcp._mcp_server.version == server.__version__
         # And it must not be the SDK's version, which is what the bug looked like.
         assert server.mcp._mcp_server.version != version("mcp")
+
+
+class TestPinnedClaims:
+    """Exact-text pinning for every claim backed by a verified Go fact.
+
+    A keyword guard can only ban reversals the author imagined; three rounds of
+    review produced three fresh evasions that kept the keywords and appended a
+    scope, a qualifier or a retraction. Comparing the whole claim verbatim is
+    closed under text nobody anticipated.
+    """
+
+    @pytest.mark.parametrize(
+        "accessor,go_ref,claim",
+        PINNED_CLAIMS,
+        ids=[f"{a}:{r.split(':')[0]}" for a, r, _ in PINNED_CLAIMS],
+    )
+    def test_claim_text_is_unchanged(self, accessor, go_ref, claim):
+        doc = normalised_doc(_resolve(accessor))
+        assert claim in doc, (
+            f"the pinned claim for {accessor} changed.\n\n"
+            f"Verified against: {go_ref}\n\n"
+            f"Expected verbatim:\n  {claim}\n\n"
+            "If the backend genuinely changed, re-read the Go source above, "
+            "then update BOTH the docstring and PINNED_CLAIMS together. Do not "
+            "update the pin to match a reworded docstring without re-verifying."
+        )
+
+    @pytest.mark.parametrize(
+        "accessor,go_ref,claim",
+        PINNED_CLAIMS,
+        ids=[f"{a}:{r.split(':')[0]}" for a, r, _ in PINNED_CLAIMS],
+    )
+    def test_claim_is_not_followed_by_a_retraction(self, accessor, go_ref, claim):
+        # Appending after a pinned claim is how every evasion worked: the claim
+        # survives intact and the sentence after it takes the meaning back.
+        # Require the claim to be followed by the end of the docstring or by a
+        # new Args entry, never by more prose about the same field.
+        doc = normalised_doc(_resolve(accessor))
+        tail = doc.split(claim, 1)[1].strip()
+        if not tail:
+            return
+        # A new Args entry looks like "word_word: ". An example block starting
+        # with "Example" is also a legitimate terminator: it stops describing
+        # the claim and starts showing usage. Anything else is commentary
+        # attached to the claim we just pinned.
+        assert (
+            re.match(r"^[a-z_]+:\s", tail)
+            or tail.startswith("Args:")
+            or tail.startswith("Example")
+        ), (
+            f"text follows the pinned claim for {accessor} without starting a "
+            f"new Args entry, which is how a claim gets scoped away:\n\n"
+            f"  ...{claim[-60:]}\n  >>> {tail[:200]}\n\n"
+            f"Verified against: {go_ref}"
+        )

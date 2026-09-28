@@ -117,12 +117,14 @@ def main() -> int:
     def drain_stderr():
         stream = proc.stderr
         assert stream is not None
-        # Incremental, not a single read()-to-EOF. EOF arrives only when EVERY
-        # holder of the write end closes it, so a forked worker that inherits
-        # stderr keeps the drain blocked past the join below -- the thread is
-        # abandoned and the buffer stays empty, which silently discards the
-        # traceback of a server that answered and then died.
-        for chunk in iter(lambda: stream.read(1), ""):
+        # Incremental, but in BLOCKS. EOF arrives only when EVERY holder of the
+        # write end closes it, so a forked worker inheriting stderr would keep a
+        # single read()-to-EOF blocked forever and the traceback would be lost.
+        # Reading one byte at a time fixes that but is ~20x slower, which
+        # back-pressures a verbose child: it cannot finish writing inside the
+        # grace window below, gets signalled mid-write, and its traceback is
+        # again never drained. Blocks keep both properties.
+        for chunk in iter(lambda: stream.read(65536), ""):
             stderr_chunks.append(chunk)
 
     stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
@@ -176,6 +178,13 @@ def main() -> int:
         #
         # Give a dying server a brief window to die visibly, then end it. A
         # healthy server costs the full window; a crashing one is caught.
+        #
+        # THE WINDOW IS 2 SECONDS AND THAT BOUND IS REAL: a server that answers
+        # correctly and crashes LATER than 2s is reported green. Measured:
+        # crash at 1.9s -> red, crash at 2.1s -> green. No finite window closes
+        # that gap, and a longer one costs every healthy run the same delay.
+        # The gate targets the 0.1.x shape (dies on first contact), which is
+        # well inside the window; later crashes are left to the test suite.
         timer.cancel()
         try:
             if proc.stdin is not None:
