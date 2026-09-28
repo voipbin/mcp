@@ -82,7 +82,11 @@ async def create_campaign(
         queue_id: UUID of the queue that answered calls are delivered to.
             Passing it enables the service_level pacing gate described above;
             omitting it disables that gate.
-        next_campaign_id: UUID of the campaign to chain to when this one ends.
+        next_campaign_id: Stored and validated, but NOT acted on. When a
+            campaign runs out of targets the server branches only on
+            end_handle (stop, or re-execute after 5s); nothing starts the
+            campaign named here. Chain campaigns yourself instead of relying
+            on this field.
     """
     client = get_client()
     body: dict[str, Any] = {

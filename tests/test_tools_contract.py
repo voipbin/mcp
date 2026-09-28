@@ -4,6 +4,9 @@ Covers the None sentinel for partial updates, the active rejection of the
 0.1.x parameters, and the unit corrections.
 """
 
+import re
+from pathlib import Path
+
 import httpx
 import pytest
 import respx
@@ -29,6 +32,29 @@ from voipbin_mcp.tools.emails import send_email
 from voipbin_mcp.tools.flows import create_flow
 from voipbin_mcp.tools.routes import get_route, list_routes
 from voipbin_mcp.server import mcp
+
+
+
+# A claim is pinned by its DIRECTION, not its keywords. Three times running, a
+# mutant kept every pinned token and appended a contradiction ("...is a myth",
+# "on current production it IS executed"), so each guard below names the
+# specific reversal of the specific claim it protects. A blanket phrase list was
+# tried first and rejected: "rejected with a 400" is a TRUE statement about flow
+# action types and address types, so banning it outright fails honest text.
+def assert_claim(doc: str, *, says: tuple[str, ...], never: tuple[str, ...]) -> str:
+    """Whitespace-normalise a docstring; require every claim, refuse reversals."""
+    flat = " ".join((doc or "").split())
+    lowered = flat.lower()
+    for phrase in says:
+        assert phrase.lower() in lowered, (
+            f"docstring no longer states {phrase!r}. Full text: {flat}"
+        )
+    for phrase in never:
+        assert phrase.lower() not in lowered, (
+            f"docstring contains {phrase!r}, which reverses the claim this test "
+            f"pins. Full text: {flat}"
+        )
+    return flat
 
 
 @pytest.fixture(autouse=True)
@@ -203,25 +229,55 @@ class TestDocumentedBehaviourMatchesTheBackend:
     def test_conference_timeout_zero_is_not_clamped(self):
         # conferencehandler/conference.go:83 is `if timeout > 0 && timeout < 60`,
         # so 0 survives and means no auto-delete.
-        doc = create_conference.__doc__ or ""
-        assert "0 means the conference is never auto-deleted" in doc
+        assert_claim(
+            create_conference.__doc__,
+            says=("0 means the conference is never auto-deleted",),
+            never=("is a myth", "clamped to 60", "0 is in fact"),
+        )
+
+    def test_create_campaign_says_next_campaign_id_does_not_chain(self):
+        # execute.go:72-84 branches only on EndHandle when targets run out;
+        # NextCampaignID is validated (status_run.go:35) and stored, but no
+        # code path starts the campaign it names.
+        assert_claim(
+            create_campaign.__doc__,
+            says=("stored and validated, but not acted on", "branches only on"),
+            never=(
+                "campaign to chain to when this one ends",
+                "automatically starts",
+                "chains to",
+            ),
+        )
 
     def test_create_campaign_explains_the_service_level_pacing_gate(self):
         # execute.go:379-382 returns true unconditionally when queueID is Nil,
         # so passing queue_id ADDS the gate rather than enabling dialing, and
         # execute.go:403 uses integer division: agents * service_level / 100.
-        doc = create_campaign.__doc__ or ""
-        assert "Omitting queue_id skips that check" in doc
-        assert "available_agents * service_level >= 100" in doc
+        doc = assert_claim(
+            create_campaign.__doc__,
+            says=(
+                "omitting queue_id skips that check",
+                "available_agents * service_level >= 100",
+            ),
+            never=(
+                "makes the campaign dial sooner",
+                "always pass queue_id",
+                "dials sooner",
+            ),
+        )
         # The earlier text claimed omitting queue_id prevented dialing, which is
         # backwards. Guard against that sentence returning.
         assert "queue_id the campaign is still created" not in doc
         # queue_id's own entry must not carry a "never dials" warning: that was
         # the inverted claim. The Args entries for outplan and outdial still do,
-        # which TestCampaignReferences pins.
-        queue_entry = doc.split("queue_id: UUID of the queue", 1)[1].split(
-            "next_campaign_id", 1
-        )[0]
+        # which TestCampaignReferences pins. Slice to the NEXT Args entry rather
+        # than to a named sibling: naming one couples this test to argument
+        # order, so moving or renaming that sibling would silently widen the
+        # slice instead of failing.
+        after_queue_id = doc.split("queue_id: UUID of the queue", 1)
+        assert len(after_queue_id) == 2, "queue_id Args entry not found"
+        queue_entry = re.split(r"\b\w+_?\w*: ", after_queue_id[1], maxsplit=1)[0]
+        assert queue_entry.strip(), "sliced an empty queue_id entry"
         assert "never dials" not in queue_entry
 
     def test_create_contact_warns_addresses_are_best_effort(self):
@@ -235,10 +291,19 @@ class TestDocumentedBehaviourMatchesTheBackend:
         # emailhandler/email.go:65 is `go h.Send(...)`, so the 201 precedes any
         # attachment resolution, and engine_sendgrid.go:75-79 logs and continues
         # when getAttachment fails. Its default branch rejects "".
-        doc = send_email.__doc__ or ""
-        assert 'Must be "recording"' in doc
-        assert "resolved AFTER the API has answered success" in doc
-        assert "still delivered" in doc
+        doc = assert_claim(
+            send_email.__doc__,
+            says=(
+                'must be "recording"',
+                "resolved after the api has answered success",
+                "still delivered",
+            ),
+            never=(
+                "does confirm the attachment",
+                "201 therefore confirms",
+                "confirms the attachment was included",
+            ),
+        )
         # "" used to be documented as the way to attach nothing. It reaches the
         # default branch, fails, and is skipped after the email is accepted.
         assert 'or "" for none' not in doc
@@ -251,24 +316,39 @@ class TestDocumentedBehaviourMatchesTheBackend:
         # Pin the DIRECTION, not the tokens: asserting only "500" and a stray
         # phrase let a mutant say "a 500 is transient, retry it" and still pass.
         # Whitespace-normalised so rewrapping the docstring does not break it.
-        flat = " ".join(doc.split())
-        assert "treat a 500 from this tool as a rejected argument rather than a transient fault" in flat
-        assert "do not retry it unchanged" in flat
-        assert "400 naming the field" not in flat
+        flat = assert_claim(
+            doc,
+            says=(
+                "treat a 500 from this tool as a rejected argument rather than "
+                "a transient fault",
+                "do not retry it unchanged",
+            ),
+            never=("400 naming the field", "a 500 is transient", "retry it unchanged after"),
+        )
+        assert flat
 
     def test_create_ai_does_not_suggest_env_var_references_for_the_key(self):
         # Nothing in ai-manager or pipecat expands the value: aihandler/db.go
         # stores engine_key verbatim, so "$OPENAI_API_KEY" is sent literally.
-        flat = " ".join((create_ai.__doc__ or "").split())
-        assert "stored and transmitted verbatim" in flat
-        assert "Nothing expands environment-variable references" in flat
-        assert "Pass an environment variable reference rather than" not in flat
+        assert_claim(
+            create_ai.__doc__,
+            says=("stored and transmitted verbatim", "nothing expands environment-variable references"),
+            never=(
+                "pass an environment variable reference rather than",
+                "expands it",
+                "at the mcp layer",
+            ),
+        )
 
     def test_create_flow_does_not_list_transfer_as_an_action_type(self):
         # models/action/action.go has no TypeTransfer; models/flow/flow.go:47
         # does, but that is a FLOW type. actionhandler rejects it with
         # INVALID_ACTION_TYPE, so listing it as an example hands out a 400.
-        flat = " ".join((create_flow.__doc__ or "").split())
+        flat = assert_claim(
+            create_flow.__doc__,
+            says=('"transfer" is a FLOW type, not an action type',),
+            never=("accepted here as an alias", "is an alias for"),
+        )
         assert '"transfer" is a FLOW type, not an action type' in flat
         # Catch it wherever it is reintroduced, not just in the call-control
         # group: a mutant that moved it next to the media examples survived an
@@ -282,23 +362,43 @@ class TestDocumentedBehaviourMatchesTheBackend:
         # grep PostFlowID across the monorepo yields only writes, a filter key
         # and a webhook echo. conferencecallhandler/terminate.go never reads it,
         # while service.go:49 does read PreFlowID on join.
-        flat = " ".join((create_conference.__doc__ or "").split())
-        assert "Stored but NOT executed" in flat
-        assert "pre_flow_id, by contrast, is genuinely executed" in flat
-        assert "flow ID to execute when a participant leaves" not in flat
+        assert_claim(
+            create_conference.__doc__,
+            says=("stored but not executed", "pre_flow_id, by contrast, is genuinely executed"),
+            never=(
+                "flow id to execute when a participant leaves",
+                "is executed on leave",
+                "on current production",
+            ),
+        )
 
     def test_contact_source_is_documented_as_unvalidated(self):
         # contacthandler/contact.go:70-71 only defaults "" to manual;
         # PostContactsJSONBodySource.Valid() has zero non-test callers.
-        flat = " ".join((create_contact.__doc__ or "").split())
-        assert "no layer validates this field" in flat
-        assert "One of: manual, import, api, sync." not in flat
+        flat = assert_claim(
+            create_contact.__doc__,
+            says=("no layer validates this field", "stored as given"),
+            never=("one of: manual, import, api, sync.", "the server validates it"),
+        )
+        # The source sentence specifically must not claim rejection.
+        source_sentence = flat.split("source: Where the contact came from", 1)[1].split(
+            "external_id:", 1
+        )[0]
+        assert "rejected with a 400" not in source_sentence.lower()
 
     def test_route_tools_warn_about_the_superadmin_requirement(self):
         # servicehandler/route.go checks PermissionProjectSuperAdmin, which an
         # accesskey identity never holds, so these 403 for ordinary customers.
         for doc in (list_routes.__doc__ or "", get_route.__doc__ or ""):
-            flat = " ".join(doc.split())
+            flat = assert_claim(
+                doc,
+                says=("requires project superadmin permission.",),
+                never=(
+                    "in practice every customer",
+                    "carries this permission, so you can call this freely",
+                    "requires customer permission",
+                ),
+            )
             # Pin BOTH statements: a keyword check on "superadmin" passed even
             # when one of the two sentences was flipped to "customer permission".
             assert "Requires project superadmin permission." in flat
@@ -792,3 +892,52 @@ class TestCallToolRoundTrip:
         )
         # But the campaign actions tool must exist as the real replacement.
         assert "update_campaign_actions" in tools
+
+
+class TestEnvironmentSanity:
+    """Guard the harness itself.
+
+    A stale editable install once pointed pytest at a COPY of the source tree
+    while mutations were written to the worktree, so an entire 28-mutant sweep
+    reported every mutant as surviving. Nothing else in the suite can detect
+    that: every test passes happily against the copy.
+
+    Identity is checked by CONTENT, not by path. A wheel-install leg legitimately
+    imports from site-packages, so requiring the worktree path would fail the
+    very runs that exercise the shipped artifact -- but in both cases the bytes
+    must match the checkout, which is exactly what a stale copy violates.
+    """
+
+    def test_the_suite_imports_the_source_under_test(self):
+        import voipbin_mcp.tools.campaigns as imported_module
+
+        imported = Path(imported_module.__file__).resolve()
+        checkout = (
+            Path(__file__).resolve().parent.parent
+            / "src"
+            / "voipbin_mcp"
+            / "tools"
+            / "campaigns.py"
+        ).resolve()
+        if imported == checkout:
+            return
+        assert imported.read_bytes() == checkout.read_bytes(), (
+            f"tests import {imported}, whose contents differ from {checkout}. "
+            "Edits to the checkout are not being exercised: reinstall from this "
+            "directory before trusting any result, especially a mutation run."
+        )
+
+
+class TestServerIdentity:
+    def test_server_reports_the_installed_distribution_version(self):
+        # FastMCP takes no version parameter, so without an override serverInfo
+        # advertises the mcp SDK's version (e.g. "1.30.0") as the server's own,
+        # leaving a client unable to tell a fixed install from the broken 0.1.x.
+        from importlib.metadata import version
+
+        import voipbin_mcp.server as server
+
+        assert server.__version__ == version("voipbin-mcp")
+        assert server.mcp._mcp_server.version == server.__version__
+        # And it must not be the SDK's version, which is what the bug looked like.
+        assert server.mcp._mcp_server.version != version("mcp")

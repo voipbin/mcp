@@ -54,20 +54,25 @@ def expected_tool_count() -> int:
 
 
 
-def _signal_group(proc: subprocess.Popen, sig: int) -> None:
+def _signal_group(pgid: int | None, proc: subprocess.Popen, sig: int) -> None:
     """Signal the child's whole process group, not just the child.
 
     A server that forks a helper would otherwise leave the helper running after
     the direct child is reaped, and the gate would exit 0 with an orphan behind
-    it. Falls back to the single process if the group is already gone.
+    it. The pgid must be captured at launch: once the direct child is reaped,
+    os.getpgid(proc.pid) raises and proc.send_signal is a no-op, so deriving it
+    here would make both arms fail silently on exactly the case that needs it.
     """
-    try:
-        os.killpg(os.getpgid(proc.pid), sig)
-    except (ProcessLookupError, PermissionError, OSError):
+    if pgid is not None:
         try:
-            proc.send_signal(sig)
-        except ProcessLookupError:
+            os.killpg(pgid, sig)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
             pass
+    try:
+        proc.send_signal(sig)
+    except (ProcessLookupError, ValueError):
+        pass
 
 
 def main() -> int:
@@ -110,13 +115,26 @@ def main() -> int:
     stderr_chunks: list[str] = []
 
     def drain_stderr():
-        assert proc.stderr is not None
-        stderr_chunks.append(proc.stderr.read())
+        stream = proc.stderr
+        assert stream is not None
+        # Incremental, not a single read()-to-EOF. EOF arrives only when EVERY
+        # holder of the write end closes it, so a forked worker that inherits
+        # stderr keeps the drain blocked past the join below -- the thread is
+        # abandoned and the buffer stays empty, which silently discards the
+        # traceback of a server that answered and then died.
+        for chunk in iter(lambda: stream.read(1), ""):
+            stderr_chunks.append(chunk)
 
     stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
     stderr_thread.start()
 
-    timer = threading.Timer(60.0, lambda: _signal_group(proc, signal.SIGKILL))
+    # Captured at launch: after the child is reaped, os.getpgid(proc.pid) raises.
+    try:
+        child_pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        child_pgid = None
+
+    timer = threading.Timer(60.0, lambda: _signal_group(child_pgid, proc, signal.SIGKILL))
     timer.start()
 
     initialized = False
@@ -171,15 +189,21 @@ def main() -> int:
             pass
 
         if proc.poll() is None:
-            _signal_group(proc, signal.SIGTERM)
+            _signal_group(child_pgid, proc, signal.SIGTERM)
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                _signal_group(proc, signal.SIGKILL)
+                _signal_group(child_pgid, proc, signal.SIGKILL)
                 try:
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     sys.stderr.write("server ignored SIGKILL; giving up on reaping it\n")
+        else:
+            # The direct child exited on its own, but a worker it forked may
+            # still be running and still holding our stderr open. Sweep the
+            # group unconditionally: skipping this on the common path is how
+            # workers were orphaned, and how the drain thread stayed blocked.
+            _signal_group(child_pgid, proc, signal.SIGTERM)
 
         # Only now close stdout: closing it while the child still runs can hand
         # it an EPIPE that looks like a crash.
