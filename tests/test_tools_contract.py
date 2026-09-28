@@ -1100,12 +1100,19 @@ class TestPinnedClaims:
         tail = doc.split(claim, 1)[1].strip()
         if not tail:
             return
-        # A new Args entry looks like "word_word: ". An example block starting
-        # with "Example" is also a legitimate terminator: it stops describing
-        # the claim and starts showing usage. Anything else is commentary
-        # attached to the claim we just pinned.
+        # A new Args entry must name a REAL parameter of this tool. Matching
+        # any lowercase word followed by a colon is not enough: "note:" and
+        # "warning:" satisfy that and were each able to carry a retraction
+        # (verified -- both survived before this was tightened). An example
+        # block is also a legitimate terminator: it stops describing the claim
+        # and starts showing usage.
+        import inspect
+
+        params = set(inspect.signature(_resolve(accessor)).parameters)
+        next_token = re.match(r"^([a-z_]+):\s", tail)
+        starts_new_arg = bool(next_token) and next_token.group(1) in params
         assert (
-            re.match(r"^[a-z_]+:\s", tail)
+            starts_new_arg
             or tail.startswith("Args:")
             or tail.startswith("Example")
         ), (
