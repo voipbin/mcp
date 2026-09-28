@@ -122,7 +122,7 @@ The AI uses `create_contact`, passing the number as an address of type `tel`.
 |---|---|---|
 | `VOIPBIN_API_KEY` | required | Your VoIPbin access key. |
 | `VOIPBIN_API_BASE_URL` | `https://api.voipbin.net/v1.0` | Full base URL including the `/v1.0` suffix. Set this to point at a self-hosted deployment. |
-| `VOIPBIN_AUTH_TRANSPORT` | `cookie` | How the key is transmitted: `cookie` or `query`. An unrecognised value fails at startup. |
+| `VOIPBIN_AUTH_TRANSPORT` | `cookie` | How the key is transmitted: `cookie` or `query`. An unrecognised value makes the server exit at startup. |
 
 ## Security Note
 

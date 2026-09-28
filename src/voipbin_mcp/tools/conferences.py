@@ -46,8 +46,9 @@ async def create_conference(
         name: Display name for the conference.
         detail: Description.
         conference_type: Required by the API, defaulted here. One of:
-            conference, connect. Any other value is normalised to connect by
-            the server.
+            conference, connect, queue. The server does not validate this
+            field: an unrecognised value is stored as given, and the underlying
+            bridge then behaves as connect.
         timeout: Conference lifetime in SECONDS (default 3600, one hour).
             Values below 60 are replaced by the server default of 86400.
         pre_flow_id: Optional flow ID to execute when a participant joins.

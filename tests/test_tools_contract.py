@@ -20,6 +20,7 @@ from voipbin_mcp.tools.contacts import (
     add_contact_address,
     add_contact_tag,
     create_contact,
+    delete_contact_address,
     delete_contact_tag,
     update_contact,
     update_contact_address,
@@ -355,6 +356,160 @@ class TestContactSubResources:
         actions = [{"type": "answer"}]
         await update_campaign_actions("x1", actions)
         assert sent_body(route) == {"actions": actions}
+
+
+class TestNewFieldsActuallyTransmitted:
+    """Positive-path body assertions for every newly exposed field.
+
+    The removal machinery and the omission cases were covered first, which left
+    a gap: a mutant that stopped SENDING a new field kept the suite green. These
+    assert the exact wire body, so dropping or misnaming a key fails here.
+    """
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_create_contact_sends_addresses_verbatim(self):
+        route = respx.post("https://api.voipbin.net/v1.0/contacts").mock(
+            return_value=httpx.Response(201, json={"id": "c1"})
+        )
+        addresses = [
+            {
+                "type": "tel",
+                "target": "+14155551234",
+                "name": "mobile",
+                "detail": "personal",
+                "is_primary": True,
+            }
+        ]
+        await create_contact(first_name="Kim", addresses=addresses)
+        assert sent_body(route)["addresses"] == addresses
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_create_contact_sends_source_external_id_and_tags(self):
+        route = respx.post("https://api.voipbin.net/v1.0/contacts").mock(
+            return_value=httpx.Response(201, json={"id": "c1"})
+        )
+        await create_contact(
+            first_name="Kim",
+            source="crm",
+            external_id="ext-9",
+            tag_ids=["t1", "t2"],
+        )
+        body = sent_body(route)
+        assert body["source"] == "crm"
+        assert body["external_id"] == "ext-9"
+        assert body["tag_ids"] == ["t1", "t2"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_add_address_sends_name_and_detail(self):
+        route = respx.post("https://api.voipbin.net/v1.0/contacts/c1/addresses").mock(
+            return_value=httpx.Response(201, json={})
+        )
+        await add_contact_address(
+            "c1", "tel", "+14155551234", name="mobile", detail="personal"
+        )
+        body = sent_body(route)
+        # The create path does carry these, unlike the update path.
+        assert body["name"] == "mobile"
+        assert body["detail"] == "personal"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_delete_address_targets_the_single_address(self):
+        route = respx.delete(
+            "https://api.voipbin.net/v1.0/contacts/c1/addresses/a1"
+        ).mock(return_value=httpx.Response(200, json={}))
+        await delete_contact_address("c1", "a1")
+        assert route.call_count == 1
+        assert route.calls[0].request.url.path == "/v1.0/contacts/c1/addresses/a1"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_campaign_reference_wire_keys_are_exact(self):
+        route = respx.post("https://api.voipbin.net/v1.0/campaigns").mock(
+            return_value=httpx.Response(200, json={"id": "x1"})
+        )
+        await create_campaign(
+            name="n",
+            detail="d",
+            campaign_type="call",
+            actions=[],
+            outplan_id="o1",
+            outdial_id="od1",
+            queue_id="q1",
+            next_campaign_id="nc1",
+        )
+        body = sent_body(route)
+        # A typo in any of these names would leave the campaign unable to dial
+        # while still answering 200.
+        assert body["outplan_id"] == "o1"
+        assert body["outdial_id"] == "od1"
+        assert body["queue_id"] == "q1"
+        assert body["next_campaign_id"] == "nc1"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_ai_parameter_is_sent_when_given(self):
+        route = respx.post("https://api.voipbin.net/v1.0/ais").mock(
+            return_value=httpx.Response(201, json={})
+        )
+        await create_ai(
+            name="n",
+            detail="d",
+            engine_model="openai.gpt-4o",
+            engine_key="k",
+            init_prompt="p",
+            tts_type="google",
+            tts_voice_id="v",
+            stt_type="google",
+            stt_language="en-US",
+            parameter={"temperature": 0.2},
+        )
+        assert sent_body(route)["parameter"] == {"temperature": 0.2}
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_ai_parameter_empty_dict_is_transmitted(self):
+        route = respx.post("https://api.voipbin.net/v1.0/ais").mock(
+            return_value=httpx.Response(201, json={})
+        )
+        await create_ai(
+            name="n",
+            detail="d",
+            engine_model="openai.gpt-4o",
+            engine_key="k",
+            init_prompt="p",
+            tts_type="google",
+            tts_voice_id="v",
+            stt_type="google",
+            stt_language="en-US",
+            parameter={},
+        )
+        # {} is a meaningful value here, distinct from omission.
+        assert sent_body(route)["parameter"] == {}
+
+
+class TestUpdateAddressLimitations:
+    """name and detail are deliberately not exposed on the update path.
+
+    The gateway accepts them and answers 200, but the RPC layer copies only
+    target and is_primary, so offering them would report success while the
+    labels stayed unchanged.
+    """
+
+    def test_name_and_detail_are_not_parameters(self):
+        import inspect
+
+        params = inspect.signature(update_contact_address).parameters
+        assert "name" not in params
+        assert "detail" not in params
+
+    def test_docstring_explains_the_workaround(self):
+        doc = update_contact_address.__doc__ or ""
+        assert "name and detail" in doc
+        assert "add_contact_address" in doc
 
 
 class TestRegistration:

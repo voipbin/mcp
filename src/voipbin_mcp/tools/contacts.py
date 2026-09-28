@@ -243,29 +243,27 @@ async def update_contact_address(
     contact_id: str,
     address_id: str,
     target: str | None = None,
-    name: str | None = None,
-    detail: str | None = None,
     is_primary: bool | None = None,
 ) -> str:
     """Update one of a contact's addresses.
 
-    Only the arguments you pass are sent. The address type cannot be changed;
-    delete the address and add a new one instead.
+    Only the arguments you pass are sent.
+
+    Two limitations, both enforced by the API rather than by this tool:
+    the address type cannot be changed, and the name and detail labels cannot
+    be changed either. To change any of those, delete the address and add it
+    again with add_contact_address.
 
     Args:
         contact_id: The UUID of the contact.
         address_id: The UUID of the address to update.
         target: The phone number (E.164) or email address.
-        name: Optional label for this address.
-        detail: Optional free-text detail.
         is_primary: Whether this becomes the primary address of its type.
     """
     client = get_client()
     body: dict[str, Any] = {}
     for key, value in (
         ("target", target),
-        ("name", name),
-        ("detail", detail),
         ("is_primary", is_primary),
     ):
         if value is not None:

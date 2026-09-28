@@ -12,6 +12,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+      # A lockfile that disagrees with pyproject.toml means the environment CI
+      # tests is not the one the release declares.
+      - run: uv lock --check
       # Scoped to the rules that catch real defects (undefined names, shadowed
       # imports, broken except clauses) rather than whole-repo style, so the
       # gate starts green and stays meaningful.
