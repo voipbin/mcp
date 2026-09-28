@@ -8,15 +8,20 @@ An MCP (Model Context Protocol) server that enables AI assistants to interact wi
 
 ## Installation
 
-```bash
-pip install voipbin-mcp
-```
-
-Or run directly without installing:
+The client configurations below all launch the server with `uvx`, which fetches
+and runs it without a manual install:
 
 ```bash
 uvx voipbin-mcp
 ```
+
+To install it into an environment instead:
+
+```bash
+pip install voipbin-mcp
+```
+
+Requires Python 3.10 or newer.
 
 ## Configuration
 
@@ -73,14 +78,14 @@ VOIPBIN_API_KEY=your-access-key voipbin-mcp
 | Active Flows | `list_activeflows`, `get_activeflow`, `stop_activeflow` |
 | Agents | `list_agents`, `get_agent` |
 | Numbers | `list_numbers`, `get_number` |
-| Contacts | `list_contacts`, `get_contact`, `create_contact`, `update_contact`, `delete_contact` |
+| Contacts | `list_contacts`, `get_contact`, `create_contact`, `update_contact`, `delete_contact`, `add_contact_address`, `update_contact_address`, `delete_contact_address`, `add_contact_tag`, `delete_contact_tag` |
 | Messages | `list_messages`, `get_message`, `send_message` |
 | Emails | `list_emails`, `get_email`, `send_email` |
 | Conversations | `list_conversations`, `get_conversation` |
 | Conferences | `list_conferences`, `get_conference`, `create_conference`, `delete_conference` |
-| Campaigns | `list_campaigns`, `get_campaign`, `create_campaign`, `update_campaign`, `delete_campaign` |
+| Campaigns | `list_campaigns`, `get_campaign`, `create_campaign`, `update_campaign`, `update_campaign_actions`, `delete_campaign` |
 | Queues | `list_queues`, `get_queue` |
-| Routes | `list_routes`, `get_route` |
+| Routes | `list_routes`, `get_route` (require project superadmin permission) |
 | Billings | `list_billings`, `get_billing` |
 | AIs | `list_ais`, `get_ai`, `create_ai` |
 | Customer | `get_customer` |
@@ -109,11 +114,41 @@ The AI uses `list_billings` to retrieve your billing history.
 **Manage contacts:**
 > "Add a new contact named John with phone number +1234567890"
 
-The AI uses `create_contact` to create the contact in your account.
+The AI uses `create_contact`, passing the number as an address of type `tel`.
+
+## Configuration reference
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VOIPBIN_API_KEY` | required | Your VoIPbin access key. |
+| `VOIPBIN_API_BASE_URL` | `https://api.voipbin.net/v1.0` | Full base URL including the `/v1.0` suffix. Set this to point at a self-hosted deployment. |
+| `VOIPBIN_AUTH_TRANSPORT` | `cookie` | How the key is transmitted: `cookie` or `query`. An unrecognised value makes the server exit at startup. |
 
 ## Security Note
 
-Your VoIPbin API key is sent as a URL query parameter (`accesskey=`) on every request. The connection uses HTTPS, so the key is encrypted in transit. However, be aware that URL parameters may be recorded in server access logs and proxy logs. Avoid sharing unredacted debug output, and rotate your key if you suspect it has been exposed.
+Your VoIPbin API key is sent in a `Cookie` header on every request, over
+HTTPS. Earlier releases sent it as a URL query parameter (`accesskey=`), which
+leaves the key in server access logs and proxy logs.
+
+If a proxy or ingress in front of your deployment strips or rewrites cookies,
+set `VOIPBIN_AUTH_TRANSPORT=query` to fall back to the query parameter. Prefer
+fixing the proxy: the query form has the logging exposure described above.
+
+Avoid sharing unredacted debug output, and rotate your key if you suspect it
+has been exposed. When configuring an AI agent with `create_ai`, pass an
+environment variable reference for `engine_key` rather than a literal provider
+key; that value is stored by the API and can appear in responses.
+
+## Known limitations
+
+- Around 12% of the VoIPbin REST API is exposed as tools. Coverage expands in
+  later releases.
+- `list_routes` and `get_route` are platform-level and answer 403 for a normal
+  customer access key.
+- `create_conference` does not expose the `data` field; it always sends an
+  empty object.
+- Attachments on `send_email` reference existing VoIPbin objects (such as a
+  recording) rather than uploading file contents.
 
 ## Getting an API Key
 
@@ -127,6 +162,27 @@ cd mcp
 uv venv
 uv pip install -e ".[dev]"
 uv run pytest tests/ -v
+```
+
+The release gate builds the distribution and installs it at both ends of the
+declared `mcp` range, because a package can pass in the lock environment and
+still be broken for everyone installing from PyPI. To reproduce that locally:
+
+```bash
+uv build
+uv run python scripts/stdio_smoke.py
+```
+
+Tool descriptions are pinned by exact text in `tests/golden_docstrings.json`,
+so any docstring edit fails the suite until the golden file is regenerated.
+That is intentional: ten documented behaviours in this package turned out to
+contradict the backend, so an edit is the moment to re-read the Go source named
+beside the claim in `PINNED_CLAIMS` and confirm it still holds. Once verified:
+
+```bash
+# optional but recommended: check every pinned Go reference still resolves
+VOIPBIN_MONOREPO=/path/to/monorepo uv run pytest tests/ -k resolve
+uv run python scripts/update_golden_docstrings.py
 ```
 
 ## License

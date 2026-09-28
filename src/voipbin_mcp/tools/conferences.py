@@ -35,7 +35,8 @@ async def get_conference(conference_id: str) -> str:
 async def create_conference(
     name: str,
     detail: str = "",
-    timeout: int = 3600000,
+    conference_type: str = "conference",
+    timeout: int = 3600,
     pre_flow_id: str = "",
     post_flow_id: str = "",
 ) -> str:
@@ -44,13 +45,22 @@ async def create_conference(
     Args:
         name: Display name for the conference.
         detail: Description.
-        timeout: Conference timeout in milliseconds (default 1 hour).
+        conference_type: Required by the API, defaulted here. One of:
+            conference, connect, queue. The server does not validate this
+            field: an unrecognised value is stored as given, and the underlying
+            bridge then behaves as connect.
+        timeout: Conference lifetime in SECONDS (default 3600, one hour).
+            0 means the conference is never auto-deleted. Any other value
+            below 60 is replaced by the server default of 86400.
         pre_flow_id: Optional flow ID to execute when a participant joins.
-        post_flow_id: Optional flow ID to execute when a participant leaves.
+        post_flow_id: Stored but NOT executed. The field is accepted and
+            persisted, and the API answers success, but no code path runs it
+            when a participant leaves. Do not rely on it for cleanup work.
+            (pre_flow_id, by contrast, is genuinely executed on join.)
     """
     client = get_client()
     body: dict = {
-        "type": "conference",
+        "type": conference_type,
         "name": name,
         "detail": detail,
         "timeout": timeout,

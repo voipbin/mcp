@@ -5,12 +5,65 @@ on:
     types: [published]
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
+    outputs:
+      floor: ${{ steps.meta.outputs.floor }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          # tomllib needs 3.11+; see scripts/dist_meta.py.
+          python-version: "3.11"
+
+      - id: meta
+        run: python scripts/dist_meta.py >> "$GITHUB_OUTPUT"
+
+      # A release tagged v0.2.0 must not publish a package that says 0.1.9.
+      # Existing tags carry a leading "v", so strip it before comparing.
+      - name: Tag matches the packaged version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          stripped="${TAG#v}"
+          if [ "$stripped" != "$VERSION" ]; then
+            echo "release tag $TAG (version $stripped) does not match" \
+                 "project.version $VERSION in pyproject.toml"
+            exit 1
+          fi
+          echo "tag $TAG matches version $VERSION"
+
+      # Built once here; the smoke jobs and the upload all consume this exact
+      # artifact, so nothing untested can reach PyPI.
+      - run: uv build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist
+          path: dist/
+
+  dist-smoke:
+    needs: build
+    uses: ./.github/workflows/dist-smoke.yml
+    with:
+      floor: ${{ needs.build.outputs.floor }}
+      version: ${{ needs.build.outputs.version }}
+
+  publish:
+    needs: [build, dist-smoke]
+    runs-on: ubuntu-latest
+    # Requires a human approval configured on the environment, so a bad release
+    # cannot reach PyPI on a tag push alone.
+    environment: pypi
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - run: uv build
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist
+      # No build step here on purpose: publishing the downloaded artifact is
+      # what makes the smoke gate meaningful.
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1

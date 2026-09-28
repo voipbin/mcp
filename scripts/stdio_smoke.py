@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Drive the installed MCP server over stdio and assert it serves every tool.
+
+An import check cannot catch a server that dies as soon as it handles traffic,
+which is what the 0.1.1 release did. And a bare `initialize` handshake cannot
+catch a server that answers politely while serving zero tools. So this speaks
+the real protocol: initialize, then tools/list, comparing the count against the
+number of @mcp.tool() decorators in the source tree.
+
+It launches the console script -- the binary every documented client config
+actually runs -- rather than `python -m`, so the gate exercises the same entry
+point users do.
+
+Runs deliberately WITHOUT VOIPBIN_API_KEY: the client is constructed lazily on
+the first tool call, so a clean handshake also proves the server does not need
+credentials to start.
+"""
+
+import importlib.metadata
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+REQUESTS = [
+    {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "dist-smoke", "version": "0"},
+        },
+    },
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+]
+
+
+def expected_tool_count() -> int:
+    """Count the decorators in the source tree, so CI holds no literal."""
+    tools_dir = Path(__file__).resolve().parent.parent / "src" / "voipbin_mcp" / "tools"
+    if not tools_dir.is_dir():
+        sys.exit(f"cannot find the tools source at {tools_dir}")
+    # Summed across files: a per-file `grep -c` would emit one count per file.
+    total = sum(path.read_text().count("@mcp.tool()") for path in tools_dir.glob("*.py"))
+    if total == 0:
+        sys.exit("found no @mcp.tool() decorators; the count would be vacuous")
+    return total
+
+
+
+def _signal_group(pgid: int | None, proc: subprocess.Popen, sig: int) -> None:
+    """Signal the child's whole process group, not just the child.
+
+    A server that forks a helper would otherwise leave the helper running after
+    the direct child is reaped, and the gate would exit 0 with an orphan behind
+    it. The pgid must be captured at launch: once the direct child is reaped,
+    os.getpgid(proc.pid) raises and proc.send_signal is a no-op, so deriving it
+    here would make both arms fail silently on exactly the case that needs it.
+    """
+    if pgid is not None:
+        try:
+            os.killpg(pgid, sig)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.send_signal(sig)
+    except (ProcessLookupError, ValueError):
+        pass
+
+
+def main() -> int:
+    # Resolved next to the interpreter running this script. No PATH fallback:
+    # a stray voipbin-mcp from another environment would otherwise be
+    # smoke-tested instead of the one just installed, and the missing-console-
+    # script case would pass green.
+    candidate = Path(sys.executable).parent / "voipbin-mcp"
+    if not os.access(candidate, os.X_OK):
+        sys.stderr.write(
+            f"no executable voipbin-mcp next to {sys.executable}: the console "
+            "script did not install, so the entry point users rely on is "
+            "broken. Run this with the interpreter of the environment under "
+            "test.\n"
+        )
+        return 1
+    executable = str(candidate)
+
+    env = {k: v for k, v in os.environ.items() if k != "VOIPBIN_API_KEY"}
+
+    # subprocess.run(input=...) closes stdin as soon as the requests are
+    # written, and the server tears its stdio task group down on EOF. That race
+    # loses the tools/list response on roughly one run in six, which would make
+    # this gate red on healthy code -- and the natural response to a flaky gate
+    # is to weaken the assertion, which is exactly the vacuous smoke this check
+    # replaced. So: keep stdin open, read until the response arrives, and only
+    # then signal EOF.
+    proc = subprocess.Popen(
+        [executable],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        # Own process group, so a server that forks a helper cannot leave the
+        # helper running when we signal: we signal the whole group below.
+        start_new_session=True,
+    )
+
+    stderr_chunks: list[str] = []
+
+    def drain_stderr():
+        stream = proc.stderr
+        assert stream is not None
+        # Incremental, in BLOCKS, on the RAW buffer. Three traps in one line:
+        #
+        #  - A single read()-to-EOF never returns while any holder of the write
+        #    end (a forked worker) keeps it open, so the traceback is lost.
+        #  - Reading one byte at a time fixes that but is ~20x slower, which
+        #    back-pressures a verbose child until it is signalled mid-write.
+        #  - TextIOWrapper.read(n) is NOT a block read: it loops until it has n
+        #    CHARS or EOF. With EOF withheld by a worker, a short traceback (a
+        #    real one is a few hundred bytes) is invisible. read1 returns what
+        #    is already buffered, which is what we actually want.
+        raw = getattr(stream, "buffer", None)
+        if raw is None:  # pragma: no cover - text mode always has .buffer
+            for chunk in iter(lambda: stream.read(1), ""):
+                stderr_chunks.append(chunk)
+            return
+        for block in iter(lambda: raw.read1(65536), b""):
+            stderr_chunks.append(block.decode("utf-8", "replace"))
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    # Captured at launch: after the child is reaped, os.getpgid(proc.pid) raises.
+    try:
+        child_pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        child_pgid = None
+
+    timer = threading.Timer(60.0, lambda: _signal_group(child_pgid, proc, signal.SIGKILL))
+    timer.start()
+
+    initialized = False
+    served = None
+    reported_version = None
+    stdout_lines: list[str] = []
+    try:
+        assert proc.stdin is not None and proc.stdout is not None
+        for request in REQUESTS:
+            proc.stdin.write(json.dumps(request) + "\n")
+        proc.stdin.flush()
+
+        for line in proc.stdout:
+            stdout_lines.append(line)
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") == 1 and "result" in message:
+                initialized = True
+                info = message["result"].get("serverInfo", {})
+                reported_version = info.get("version")
+                print(f"initialize OK: {info.get('name')} {reported_version}")
+            if message.get("id") == 2:
+                if "result" in message:
+                    served = len(message["result"].get("tools", []))
+                else:
+                    sys.stderr.write(f"tools/list returned an error: {line}")
+                break
+    finally:
+        # The answer is in hand (or the server died). Two competing hazards:
+        #
+        #  - Waiting for the server to notice EOF stalls the gate when it keeps
+        #    writing after answering: it blocks on a full 64KB stdout pipe and
+        #    never exits, which used to turn a CORRECT server red.
+        #  - Killing it immediately masks a server that answers and THEN dies.
+        #    That is the exact shape of the 0.1.x failure this gate exists to
+        #    catch, so it must not be traded away for speed.
+        #
+        # Give a dying server a brief window to die visibly, then end it. A
+        # healthy server costs the full window; a crashing one is caught.
+        #
+        # THE WINDOW IS 2 SECONDS AND THAT BOUND IS REAL: a server that answers
+        # correctly and crashes LATER than 2s is reported green. Measured:
+        # crash at 1.9s -> red, crash at 2.1s -> green. No finite window closes
+        # that gap, and a longer one costs every healthy run the same delay.
+        # The gate targets the 0.1.x shape (dies on first contact), which is
+        # well inside the window; later crashes are left to the test suite.
+        timer.cancel()
+
+        # Sampled while stdin is STILL OPEN: a server that exits here quit on us
+        # mid-session. Once stdin closes, exiting is the correct response to EOF
+        # and says nothing about health, so this is the only window in which a
+        # self-chosen exit is evidence of anything.
+        #
+        # The window has to be a WAIT, not a bare poll(). Polling the instant
+        # the answer arrives returns None even for a server that called
+        # os._exit(0) in the same breath, because it has not been reaped yet --
+        # measured: bare poll() let `exit_zero_silently` pass. The 2s bound
+        # documented above is spent here, with stdin held open, so it costs a
+        # healthy server nothing extra.
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        exited_before_shutdown = proc.poll()
+
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except BrokenPipeError:
+            pass
+
+        # A server still alive here has seen EOF. It gets a SHORT moment to act
+        # on it: the 2s crash window above was already spent with stdin open, so
+        # repeating it here doubled every healthy run (2.3s -> 4.1s measured) to
+        # detect nothing new -- a server that reaches this point has already
+        # proven it survived being talked to.
+        try:
+            proc.wait(timeout=0.3)
+        except subprocess.TimeoutExpired:
+            pass
+
+        if proc.poll() is None:
+            _signal_group(child_pgid, proc, signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                _signal_group(child_pgid, proc, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    sys.stderr.write("server ignored SIGKILL; giving up on reaping it\n")
+        else:
+            # The direct child exited on its own, but a worker it forked may
+            # still be running and still holding our stderr open. Sweep the
+            # group unconditionally: skipping this on the common path is how
+            # workers were orphaned, and how the drain thread stayed blocked.
+            _signal_group(child_pgid, proc, signal.SIGTERM)
+
+        # Only now close stdout: closing it while the child still runs can hand
+        # it an EPIPE that looks like a crash.
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except (OSError, ValueError):
+                pass
+        stderr_thread.join(timeout=10)
+
+    exit_status = proc.returncode
+
+    stderr_text = "".join(stderr_chunks)
+    stdout_text = "".join(stdout_lines)
+
+    if "Traceback" in stderr_text:
+        sys.stderr.write("server raised while handling traffic:\n")
+        sys.stderr.write(stderr_text)
+        return 1
+
+    # A server that answers and then dies is broken for any client that holds
+    # the session open -- and not every death prints a traceback (os._exit, a
+    # segfault, a C-level abort), so the traceback check above is not enough.
+    #
+    # The obvious next check, "it exited on its own, therefore it is broken",
+    # is WRONG and was measured to be wrong: closing stdin is itself a request
+    # to stop, and a correct stdio server responds to EOF by exiting 0. The real
+    # server did exactly that and the gate failed all 15 runs.
+    #
+    # So the question is narrower: did it quit BEFORE we closed stdin? That is
+    # the moment recorded in `exited_before_shutdown`, sampled while stdin was
+    # still open. Everything after that point is a legitimate shutdown, where
+    # only a NON-zero status is a complaint.
+    if exited_before_shutdown is not None:
+        sys.stderr.write(
+            f"server exited on its own with status {exited_before_shutdown} "
+            "after answering, while the session was still open. It completed "
+            "the handshake and then quit, which breaks any client holding the "
+            "session open.\n"
+        )
+        if stderr_text:
+            sys.stderr.write(f"stderr: {stderr_text[:2000]}\n")
+        return 1
+
+    if exit_status not in (None, 0, -signal.SIGTERM, -signal.SIGKILL):
+        sys.stderr.write(
+            f"server exited with status {exit_status} on shutdown, which is "
+            "not a clean exit.\n"
+        )
+        if stderr_text:
+            sys.stderr.write(f"stderr: {stderr_text[:2000]}\n")
+        return 1
+
+    if not initialized:
+        sys.stderr.write("no initialize result on stdout\n")
+        sys.stderr.write(f"stdout: {stdout_text[:2000]}\n")
+        sys.stderr.write(f"stderr: {stderr_text[:2000]}\n")
+        return 1
+
+    if served is None:
+        sys.stderr.write("server answered initialize but not tools/list\n")
+        sys.stderr.write(f"stdout: {stdout_text[:2000]}\n")
+        sys.stderr.write(f"stderr: {stderr_text[:2000]}\n")
+        return 1
+
+    expected = expected_tool_count()
+    # serverInfo carries the mcp SDK's version unless we override it, which made
+    # the server report e.g. "1.30.0" as its own version. Pin it: a client cannot
+    # tell a fixed install from the broken 0.1.x without this.
+    try:
+        expected_version = importlib.metadata.version("voipbin-mcp")
+    except importlib.metadata.PackageNotFoundError:
+        sys.stderr.write(
+            "voipbin-mcp is not installed in the environment of "
+            f"{sys.executable}, so its version cannot be checked. Run this with "
+            "the interpreter of the environment under test.\n"
+        )
+        return 1
+    if reported_version != expected_version:
+        sys.stderr.write(
+            f"server reported version {reported_version!r} but the installed "
+            f"distribution is {expected_version!r}. serverInfo.version defaults "
+            "to the mcp SDK's version, so a client cannot identify which "
+            "voipbin-mcp it is talking to.\n"
+        )
+        return 1
+
+    if served != expected:
+        sys.stderr.write(
+            f"served {served} tools over stdio but the source declares "
+            f"{expected}. A server that starts and serves nothing is exactly "
+            "the failure this check exists to catch.\n"
+        )
+        return 1
+
+    print(f"tools/list OK: {served} tools served")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

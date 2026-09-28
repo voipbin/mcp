@@ -48,9 +48,14 @@ async def create_call(
     """Create a new outbound call.
 
     Args:
-        source_type: Source address type. One of: tel, sip, agent.
+        source_type: Source address type. The types that make sense for an
+            outbound call are tel, sip, agent and extension. The platform
+            defines more (ai, ai_team, conference, email, line, webchat,
+            web_session, whatsapp), so an unlisted value is not necessarily
+            rejected, it is simply not meaningful here.
         source_target: Source address (e.g., "+14155551234" for tel, UUID for agent).
-        destination_type: Destination address type. One of: tel, sip, agent.
+        destination_type: Destination address type. Same set as source_type:
+            tel, sip, agent and extension are the meaningful ones here.
         destination_target: Destination address (e.g., "+14155555678" for tel).
         flow_id: Optional flow ID to execute when the call connects.
     """
