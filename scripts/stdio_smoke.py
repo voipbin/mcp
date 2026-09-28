@@ -16,9 +16,9 @@ the first tool call, so a clean handshake also proves the server does not need
 credentials to start.
 """
 
+import importlib.metadata
 import json
 import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -53,20 +53,20 @@ def expected_tool_count() -> int:
 
 
 def main() -> int:
-    # Resolved next to the interpreter running this script, not merely from
-    # PATH: a stray voipbin-mcp from another environment would otherwise be
-    # smoke-tested instead of the one just installed.
+    # Resolved next to the interpreter running this script. No PATH fallback:
+    # a stray voipbin-mcp from another environment would otherwise be
+    # smoke-tested instead of the one just installed, and the missing-console-
+    # script case would pass green.
     candidate = Path(sys.executable).parent / "voipbin-mcp"
-    if candidate.exists():
-        executable = str(candidate)
-    else:
-        executable = shutil.which("voipbin-mcp")
-    if not executable:
+    if not os.access(candidate, os.X_OK):
         sys.stderr.write(
-            "voipbin-mcp is not on PATH: the console script did not install, "
-            "so the entry point users rely on is broken.\n"
+            f"no executable voipbin-mcp next to {sys.executable}: the console "
+            "script did not install, so the entry point users rely on is "
+            "broken. Run this with the interpreter of the environment under "
+            "test.\n"
         )
         return 1
+    executable = str(candidate)
 
     env = {k: v for k, v in os.environ.items() if k != "VOIPBIN_API_KEY"}
 
@@ -100,6 +100,7 @@ def main() -> int:
 
     initialized = False
     served = None
+    reported_version = None
     stdout_lines: list[str] = []
     try:
         assert proc.stdin is not None and proc.stdout is not None
@@ -116,7 +117,8 @@ def main() -> int:
             if message.get("id") == 1 and "result" in message:
                 initialized = True
                 info = message["result"].get("serverInfo", {})
-                print(f"initialize OK: {info.get('name')} {info.get('version')}")
+                reported_version = info.get("version")
+                print(f"initialize OK: {info.get('name')} {reported_version}")
             if message.get("id") == 2:
                 if "result" in message:
                     served = len(message["result"].get("tools", []))
@@ -124,13 +126,36 @@ def main() -> int:
                     sys.stderr.write(f"tools/list returned an error: {line}")
                 break
     finally:
+        # The answer is in hand (or the server died), so nothing more is wanted
+        # from the child. Terminate it rather than waiting for it to notice EOF:
+        # a server that keeps writing after answering would otherwise block on a
+        # full stdout pipe and stall this gate until the kill timer fired, and a
+        # server wedged for any other reason would hold it open too. Ending it
+        # here keeps the gate fast and leaves no process behind.
         timer.cancel()
         try:
             if proc.stdin is not None:
                 proc.stdin.close()
         except BrokenPipeError:
             pass
-        proc.wait(timeout=30)
+
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                sys.stderr.write("server ignored SIGKILL; giving up on reaping it\n")
+
+        # Only now close stdout: closing it while the child still runs can hand
+        # it an EPIPE that looks like a crash.
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except (OSError, ValueError):
+                pass
         stderr_thread.join(timeout=10)
 
     stderr_text = "".join(stderr_chunks)
@@ -154,6 +179,27 @@ def main() -> int:
         return 1
 
     expected = expected_tool_count()
+    # serverInfo carries the mcp SDK's version unless we override it, which made
+    # the server report e.g. "1.30.0" as its own version. Pin it: a client cannot
+    # tell a fixed install from the broken 0.1.x without this.
+    try:
+        expected_version = importlib.metadata.version("voipbin-mcp")
+    except importlib.metadata.PackageNotFoundError:
+        sys.stderr.write(
+            "voipbin-mcp is not installed in the environment of "
+            f"{sys.executable}, so its version cannot be checked. Run this with "
+            "the interpreter of the environment under test.\n"
+        )
+        return 1
+    if reported_version != expected_version:
+        sys.stderr.write(
+            f"server reported version {reported_version!r} but the installed "
+            f"distribution is {expected_version!r}. serverInfo.version defaults "
+            "to the mcp SDK's version, so a client cannot identify which "
+            "voipbin-mcp it is talking to.\n"
+        )
+        return 1
+
     if served != expected:
         sys.stderr.write(
             f"served {served} tools over stdio but the source declares "

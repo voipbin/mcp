@@ -34,6 +34,26 @@ jobs:
           pip install "dist/voipbin_mcp-${{ inputs.version }}-py3-none-any.whl[dev]"
           python -c "from importlib.metadata import version; print('resolved mcp', version('mcp'))"
 
+      # The originating bug was pip resolving mcp 2.x, where FastMCP was
+      # renamed. Printing the resolved version is not enough: if the "<2" upper
+      # bound were ever dropped, this leg would print "resolved mcp 2.x" and
+      # stay green. Assert the bound instead.
+      - name: Assert the resolved mcp is inside the declared range
+        run: |
+          python - <<'PY'
+          import sys
+          from importlib.metadata import version
+
+          got = version("mcp")
+          major = int(got.split(".")[0])
+          if major != 1:
+              sys.exit(
+                  f"resolved mcp {got}, outside the declared >=1,<2 range. "
+                  "mcp 2.x renamed FastMCP, which is what broke 0.1.1."
+              )
+          print("resolved mcp", got, "- inside the declared range")
+          PY
+
       - name: Import the server
         run: python -c "import voipbin_mcp.server, voipbin_mcp.tools"
 

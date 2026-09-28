@@ -204,12 +204,23 @@ class TestDocumentedBehaviourMatchesTheBackend:
         doc = create_conference.__doc__ or ""
         assert "0 means the conference is never auto-deleted" in doc
 
-    def test_create_campaign_warns_service_level_must_exceed_zero_with_a_queue(self):
-        # execute.go:403 computes available_agents * service_level / 100, so a
-        # queued campaign with the default 0 has zero capacity and never dials.
+    def test_create_campaign_explains_the_service_level_pacing_gate(self):
+        # execute.go:379-382 returns true unconditionally when queueID is Nil,
+        # so passing queue_id ADDS the gate rather than enabling dialing, and
+        # execute.go:403 uses integer division: agents * service_level / 100.
         doc = create_campaign.__doc__ or ""
-        assert "service_level above 0" in doc
-        assert "never dials" in doc
+        assert "Omitting queue_id skips that check" in doc
+        assert "available_agents * service_level >= 100" in doc
+        # The earlier text claimed omitting queue_id prevented dialing, which is
+        # backwards. Guard against that sentence returning.
+        assert "queue_id the campaign is still created" not in doc
+        # queue_id's own entry must not carry a "never dials" warning: that was
+        # the inverted claim. The Args entries for outplan and outdial still do,
+        # which TestCampaignReferences pins.
+        queue_entry = doc.split("queue_id: UUID of the queue", 1)[1].split(
+            "next_campaign_id", 1
+        )[0]
+        assert "never dials" not in queue_entry
 
     def test_create_contact_warns_addresses_are_best_effort(self):
         # contacthandler/contact.go:113-115 logs and continues when
@@ -217,6 +228,27 @@ class TestDocumentedBehaviourMatchesTheBackend:
         doc = create_contact.__doc__ or ""
         assert "best-effort" in doc
         assert "add_contact_address" in doc
+
+    def test_send_email_warns_attachments_resolve_after_the_response(self):
+        # emailhandler/email.go:65 is `go h.Send(...)`, so the 201 precedes any
+        # attachment resolution, and engine_sendgrid.go:75-79 logs and continues
+        # when getAttachment fails. Its default branch rejects "".
+        doc = send_email.__doc__ or ""
+        assert 'Must be "recording"' in doc
+        assert "resolved AFTER the API has answered success" in doc
+        assert "still delivered" in doc
+        # "" used to be documented as the way to attach nothing. It reaches the
+        # default branch, fails, and is skipped after the email is accepted.
+        assert 'or "" for none' not in doc
+
+    def test_create_ai_says_an_unsupported_value_is_a_500(self):
+        # aihandler/chatbot.go returns a bare fmt.Errorf for engine_model,
+        # tts_type and stt_type, which listenhandler/main.go:198 maps to
+        # simpleResponse(500) -> error_translate.go:94 -> INTERNAL.
+        doc = create_ai.__doc__ or ""
+        assert "500" in doc
+        assert "do not retry it unchanged" in doc
+        assert "400 naming the field" not in doc
 
 
 class TestNewlyExposedRequiredFields:
@@ -272,6 +304,16 @@ class TestNewlyExposedRequiredFields:
 
     @respx.mock
     @pytest.mark.asyncio
+    async def test_email_attachments_empty_list_is_transmitted(self):
+        """[] is distinct from omission: the field is required by the API."""
+        route = respx.post("https://api.voipbin.net/v1.0/emails").mock(
+            return_value=httpx.Response(201, json={})
+        )
+        await send_email("a@example.com", "s", "c", attachments=[])
+        assert sent_body(route)["attachments"] == []
+
+    @respx.mock
+    @pytest.mark.asyncio
     async def test_email_attachments_pass_through(self):
         route = respx.post("https://api.voipbin.net/v1.0/emails").mock(
             return_value=httpx.Response(201, json={})
@@ -314,8 +356,42 @@ class TestCampaignReferences:
             assert key not in body
 
     def test_docstring_warns_that_omitting_them_means_no_dialing(self):
-        doc = create_campaign.__doc__
-        assert "never dial" in doc
+        # Scoped to outplan and outdial: those two genuinely stop dialing when
+        # absent (execute.go:52,63). queue_id does NOT -- see
+        # TestDocumentedBehaviourMatchesTheBackend for that claim.
+        doc = create_campaign.__doc__ or ""
+        assert "outplan_id: UUID of the outplan" in doc
+        assert "outdial_id: UUID of the outdial list" in doc
+        # Both of these genuinely stop dialing, so both carry the warning.
+        after_outplan = doc.split("outplan_id: UUID of the outplan", 1)[1]
+        assert "never dials" in after_outplan.split("outdial_id", 1)[0]
+        assert "never dials" in after_outplan.split("outdial_id", 1)[1].split(
+            "queue_id", 1
+        )[0]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_empty_string_reference_is_transmitted_not_dropped(self):
+        """An empty string is a deliberate value, distinct from omission.
+
+        A truthiness check here would silently swallow it, which is the sentinel
+        bug this tool was rewritten to avoid.
+        """
+        route = respx.post("https://api.voipbin.net/v1.0/campaigns").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        await create_campaign(
+            name="c",
+            detail="d",
+            campaign_type="call",
+            actions=[],
+            outplan_id="",
+            queue_id="",
+        )
+        body = sent_body(route)
+        assert body["outplan_id"] == ""
+        assert body["queue_id"] == ""
+        assert "outdial_id" not in body
 
 
 class TestContactSubResources:
@@ -567,3 +643,94 @@ class TestRegistration:
             "delete_contact_tag",
             "update_campaign_actions",
         } <= names
+
+
+def _content(result):
+    """Normalise call_tool's return across mcp versions.
+
+    1.2.0 returns a list of content blocks; 1.30.0 returns
+    (content, structured_result). A test that assumed either shape would pass on
+    one end of the declared range and fail on the other, so the floor CI leg
+    would go red for a reason unrelated to the code under test.
+    """
+    if isinstance(result, tuple):
+        return result[0]
+    return result
+
+
+class TestCallToolRoundTrip:
+    """Exercise tools the way an MCP client does, not by direct invocation.
+
+    Direct calls bypass the schema layer entirely. These go through call_tool,
+    which is where pydantic coercion, unknown-argument handling and the error
+    surface an LLM actually sees all live.
+    """
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_a_successful_call_returns_the_payload_as_text(self):
+        respx.get("https://api.voipbin.net/v1.0/calls").mock(
+            return_value=httpx.Response(200, json={"result": [{"id": "c1"}]})
+        )
+        content = _content(await mcp.call_tool("list_calls", {}))
+        assert len(content) == 1
+        assert "c1" in content[0].text
+
+    @pytest.mark.asyncio
+    async def test_a_removed_parameter_reaches_the_llm_as_an_error(self):
+        """The message must name the replacement, not just fail.
+
+        A silent drop is what shipped in 0.1.x: pydantic ignored the argument
+        and the contact was created with no way to reach it.
+        """
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        with pytest.raises(ToolError) as excinfo:
+            await mcp.call_tool(
+                "create_contact",
+                {"first_name": "Kim", "phone_numbers": [{"number": "+14155551234"}]},
+            )
+
+        message = str(excinfo.value)
+        assert "removed in voipbin-mcp 0.2.0" in message
+        assert "addresses" in message
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_an_api_error_reaches_the_llm_with_the_server_reason(self):
+        respx.get("https://api.voipbin.net/v1.0/calls").mock(
+            return_value=httpx.Response(
+                401,
+                json={
+                    "error": {
+                        "message": "The provided credentials are invalid.",
+                        "reason": "INVALID_CREDENTIALS",
+                        "request_id": "req_1",
+                        "status": 401,
+                    }
+                },
+            )
+        )
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        with pytest.raises(ToolError) as excinfo:
+            await mcp.call_tool("list_calls", {})
+
+        message = str(excinfo.value)
+        assert "401" in message
+        assert "INVALID_CREDENTIALS" in message
+        # The envelope's message used to be dropped, leaving the LLM with "".
+        assert "credentials are invalid" in message
+        assert "req_1" in message
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_the_schema_omits_the_fields_dict_that_was_removed(self):
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        schema = tools["update_contact"].inputSchema
+        assert "fields" in schema["properties"], (
+            "the parameter must stay in the schema so a legacy call raises a "
+            "named error instead of an unactionable validation failure"
+        )
+        # But the campaign actions tool must exist as the real replacement.
+        assert "update_campaign_actions" in tools

@@ -43,11 +43,19 @@ async def send_email(
     Attachments reference something already stored in VoIPbin rather than
     carrying file bytes. Each entry accepts exactly two keys:
 
-      reference_type  "recording" to attach a call recording, or "" for none.
-      reference_id    UUID of the referenced object.
+      reference_type  Must be "recording". No other value attaches anything.
+      reference_id    UUID of the recording to attach.
 
     Example:
         attachments=[{"reference_type": "recording", "reference_id": "<uuid>"}]
+
+    Attachments are resolved AFTER the API has answered success: the send runs
+    in the background, and an attachment that cannot be resolved (an
+    unsupported reference_type, or a reference_id that does not exist) is logged
+    and skipped. The email is still delivered, without it. So a success response
+    here confirms the email was accepted, never that an attachment was
+    included. To send with no attachments, omit this argument entirely rather
+    than passing a placeholder entry.
 
     Args:
         destination_email: Recipient email address.

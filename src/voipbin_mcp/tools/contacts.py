@@ -82,7 +82,9 @@ async def create_contact(
         display_name: Display name (shown in UI).
         company: Company name.
         job_title: Job title.
-        source: Where the contact came from. One of: manual, import, api, sync.
+        source: Where the contact came from. The values the platform uses are
+            manual, import, api and sync, but no layer validates this field, so
+            an unrecognised string is stored as given. Omit it to get manual.
         external_id: Your own identifier for this contact.
         notes: Free-text notes.
         addresses: List of address objects; see the format above.

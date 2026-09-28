@@ -47,8 +47,10 @@ async def create_ai(
     """Create a new AI voice agent.
 
     Provider lists change as vendors are added, so the values below are
-    examples rather than the complete set. An unsupported value is rejected
-    with a 400 naming the field.
+    examples rather than the complete set. An unsupported engine_model,
+    tts_type or stt_type comes back as a 500 INTERNAL error with no indication
+    of which field was wrong, so treat a 500 from this tool as a rejected
+    argument rather than a transient fault, and do not retry it unchanged.
 
     Args:
         name: AI agent name.

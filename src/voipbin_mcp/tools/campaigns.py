@@ -50,17 +50,20 @@ async def create_campaign(
 ) -> str:
     """Create a new outbound campaign.
 
-    A campaign needs an outplan (dialing schedule), an outdial (the list of
-    targets) and a queue to actually place calls. If you omit outplan_id,
-    outdial_id or queue_id the campaign is still created, but it will never
-    dial anyone: the server skips validation for an empty reference and the
-    campaign sits idle. Create or look up those resources first and pass their
-    UUIDs.
+    A campaign needs an outplan (the dialing schedule) and an outdial (the list
+    of targets) to place calls. Omit either and the campaign is still created
+    and answers success, but it never dials: the server skips validation for an
+    empty reference, then finds no schedule or no targets at execution time.
+    Create or look up those resources first and pass their UUIDs.
 
-    If you pass queue_id you must also pass a service_level above 0. The server
-    computes how many calls it may have in flight as
-    available_agents * service_level / 100, so the default of 0 yields a
-    capacity of 0 and the campaign never dials despite being fully configured.
+    queue_id behaves differently, and not the way it reads. It is where answered
+    calls are delivered, and passing it ENABLES a pacing gate: the server then
+    only dials while
+    available_agents * service_level / 100 > calls_already_dialing,
+    using integer division. Omitting queue_id skips that check entirely. So a
+    queued campaign needs available_agents * service_level >= 100 before it
+    dials at all, which the default service_level of 0 never satisfies, and
+    neither does one available agent at service_level 50.
 
     Args:
         name: Campaign name.
@@ -68,16 +71,17 @@ async def create_campaign(
         campaign_type: Type of campaign. One of: call, flow.
         actions: Flow actions to execute for each campaign contact.
         service_level: Target service level percentage, 0-100 (default 0).
-            Must be above 0 whenever queue_id is set; see above.
+            Only consulted when queue_id is set, and then
+            available_agents * service_level must reach 100; see above.
         end_handle: What to do when the outdial list is exhausted. One of:
             stop, continue.
         outplan_id: UUID of the outplan that defines the dialing schedule.
             Without it the campaign never dials.
         outdial_id: UUID of the outdial list holding the targets. Without it
             the campaign never dials.
-        queue_id: UUID of the queue that answered calls are sent to. Without
-            it the campaign never dials. With it, service_level must be
-            above 0.
+        queue_id: UUID of the queue that answered calls are delivered to.
+            Passing it enables the service_level pacing gate described above;
+            omitting it disables that gate.
         next_campaign_id: UUID of the campaign to chain to when this one ends.
     """
     client = get_client()
@@ -124,8 +128,9 @@ async def update_campaign(
         name: Campaign name.
         detail: Description.
         campaign_type: Type of campaign. One of: call, flow.
-        service_level: Target service level percentage, 0-100. A campaign with
-            a queue needs this above 0 to dial; see create_campaign.
+        service_level: Target service level percentage, 0-100. Only consulted
+            when the campaign has a queue; see create_campaign for how it
+            gates dialing.
         end_handle: What to do when the outdial list is exhausted. One of:
             stop, continue.
         fields: Removed in 0.2.0. Pass the named arguments instead.
