@@ -50,7 +50,8 @@ async def create_conference(
             field: an unrecognised value is stored as given, and the underlying
             bridge then behaves as connect.
         timeout: Conference lifetime in SECONDS (default 3600, one hour).
-            Values below 60 are replaced by the server default of 86400.
+            0 means the conference is never auto-deleted. Any other value
+            below 60 is replaced by the server default of 86400.
         pre_flow_id: Optional flow ID to execute when a participant joins.
         post_flow_id: Optional flow ID to execute when a participant leaves.
     """

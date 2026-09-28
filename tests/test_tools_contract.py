@@ -190,6 +190,35 @@ class TestUnits:
             assert "millisecond" not in doc.lower(), fn.__name__
 
 
+class TestDocumentedBehaviourMatchesTheBackend:
+    """Claims that a reader would act on, each pinned to a Go source fact.
+
+    Every one of these replaced a sentence that was wrong: the docstrings are
+    the only contract an LLM sees, so a false claim here is a product defect,
+    not a comment typo.
+    """
+
+    def test_conference_timeout_zero_is_not_clamped(self):
+        # conferencehandler/conference.go:83 is `if timeout > 0 && timeout < 60`,
+        # so 0 survives and means no auto-delete.
+        doc = create_conference.__doc__ or ""
+        assert "0 means the conference is never auto-deleted" in doc
+
+    def test_create_campaign_warns_service_level_must_exceed_zero_with_a_queue(self):
+        # execute.go:403 computes available_agents * service_level / 100, so a
+        # queued campaign with the default 0 has zero capacity and never dials.
+        doc = create_campaign.__doc__ or ""
+        assert "service_level above 0" in doc
+        assert "never dials" in doc
+
+    def test_create_contact_warns_addresses_are_best_effort(self):
+        # contacthandler/contact.go:113-115 logs and continues when
+        # AddressCreate fails, then returns success anyway.
+        doc = create_contact.__doc__ or ""
+        assert "best-effort" in doc
+        assert "add_contact_address" in doc
+
+
 class TestNewlyExposedRequiredFields:
     """Spec-required fields get defaults so existing calls keep working."""
 

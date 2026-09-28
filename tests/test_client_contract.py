@@ -222,3 +222,56 @@ class TestBaseURL:
         )
         await client.get("/calls")
         assert route.call_count == 1
+
+
+class TestStartupValidation:
+    """main() rejects a bad auth transport before serving.
+
+    The HTTP client is lazy, so without this check an unrecognised value would
+    not surface until the first tool call -- long after the operator stopped
+    watching the logs.
+    """
+
+    def test_unrecognised_transport_exits(self, monkeypatch):
+        import voipbin_mcp.server as server
+
+        monkeypatch.setenv("VOIPBIN_API_KEY", "k")
+        monkeypatch.setenv("VOIPBIN_AUTH_TRANSPORT", "header")
+        # Stubbed so that a regression fails as a clean assertion instead of
+        # starting a real stdio server inside the test process.
+        monkeypatch.setattr(
+            server.mcp, "run", lambda **kw: pytest.fail("served despite a bad transport")
+        )
+
+        with pytest.raises(SystemExit) as excinfo:
+            server.main()
+
+        message = str(excinfo.value)
+        # The operator has to be able to act on this without reading the source.
+        assert "cookie" in message and "query" in message
+        assert "header" in message
+
+    def test_valid_transports_reach_the_server(self, monkeypatch):
+        import voipbin_mcp.server as server
+
+        started = []
+        monkeypatch.setenv("VOIPBIN_API_KEY", "k")
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: started.append(kw))
+
+        for value in ("cookie", "query", "COOKIE", " query "):
+            monkeypatch.setenv("VOIPBIN_AUTH_TRANSPORT", value)
+            server.main()
+
+        assert len(started) == 4
+        assert all(kw == {"transport": "stdio"} for kw in started)
+
+    def test_unset_transport_reaches_the_server(self, monkeypatch):
+        import voipbin_mcp.server as server
+
+        started = []
+        monkeypatch.setenv("VOIPBIN_API_KEY", "k")
+        monkeypatch.delenv("VOIPBIN_AUTH_TRANSPORT", raising=False)
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: started.append(kw))
+
+        server.main()
+        assert started == [{"transport": "stdio"}]

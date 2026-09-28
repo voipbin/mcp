@@ -67,6 +67,12 @@ async def create_contact(
       detail     Optional free-text detail.
       is_primary Optional boolean; marks the primary address of its type.
 
+    Addresses and tags given here are written on a best-effort basis: if one
+    fails (for example because the number already belongs to another contact),
+    the API still creates the contact and answers success, with that address
+    missing. To be certain an address was stored, create the contact first and
+    then call add_contact_address, which reports a duplicate as an error.
+
     Example:
         addresses=[{"type": "tel", "target": "+14155551234", "is_primary": true}]
 

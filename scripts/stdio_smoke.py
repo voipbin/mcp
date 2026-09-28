@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 REQUESTS = [
@@ -52,7 +53,14 @@ def expected_tool_count() -> int:
 
 
 def main() -> int:
-    executable = shutil.which("voipbin-mcp")
+    # Resolved next to the interpreter running this script, not merely from
+    # PATH: a stray voipbin-mcp from another environment would otherwise be
+    # smoke-tested instead of the one just installed.
+    candidate = Path(sys.executable).parent / "voipbin-mcp"
+    if candidate.exists():
+        executable = str(candidate)
+    else:
+        executable = shutil.which("voipbin-mcp")
     if not executable:
         sys.stderr.write(
             "voipbin-mcp is not on PATH: the console script did not install, "
@@ -62,44 +70,87 @@ def main() -> int:
 
     env = {k: v for k, v in os.environ.items() if k != "VOIPBIN_API_KEY"}
 
-    proc = subprocess.run(
+    # subprocess.run(input=...) closes stdin as soon as the requests are
+    # written, and the server tears its stdio task group down on EOF. That race
+    # loses the tools/list response on roughly one run in six, which would make
+    # this gate red on healthy code -- and the natural response to a flaky gate
+    # is to weaken the assertion, which is exactly the vacuous smoke this check
+    # replaced. So: keep stdin open, read until the response arrives, and only
+    # then signal EOF.
+    proc = subprocess.Popen(
         [executable],
-        input="".join(json.dumps(request) + "\n" for request in REQUESTS),
-        capture_output=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=60,
         env=env,
     )
 
-    if "Traceback" in proc.stderr:
-        sys.stderr.write("server raised while handling traffic:\n")
-        sys.stderr.write(proc.stderr)
-        return 1
+    stderr_chunks: list[str] = []
+
+    def drain_stderr():
+        assert proc.stderr is not None
+        stderr_chunks.append(proc.stderr.read())
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    timer = threading.Timer(60.0, proc.kill)
+    timer.start()
 
     initialized = False
     served = None
-    for line in proc.stdout.splitlines():
+    stdout_lines: list[str] = []
+    try:
+        assert proc.stdin is not None and proc.stdout is not None
+        for request in REQUESTS:
+            proc.stdin.write(json.dumps(request) + "\n")
+        proc.stdin.flush()
+
+        for line in proc.stdout:
+            stdout_lines.append(line)
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") == 1 and "result" in message:
+                initialized = True
+                info = message["result"].get("serverInfo", {})
+                print(f"initialize OK: {info.get('name')} {info.get('version')}")
+            if message.get("id") == 2:
+                if "result" in message:
+                    served = len(message["result"].get("tools", []))
+                else:
+                    sys.stderr.write(f"tools/list returned an error: {line}")
+                break
+    finally:
+        timer.cancel()
         try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if message.get("id") == 1 and "result" in message:
-            initialized = True
-            info = message["result"].get("serverInfo", {})
-            print(f"initialize OK: {info.get('name')} {info.get('version')}")
-        if message.get("id") == 2 and "result" in message:
-            served = len(message["result"].get("tools", []))
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        proc.wait(timeout=30)
+        stderr_thread.join(timeout=10)
+
+    stderr_text = "".join(stderr_chunks)
+    stdout_text = "".join(stdout_lines)
+
+    if "Traceback" in stderr_text:
+        sys.stderr.write("server raised while handling traffic:\n")
+        sys.stderr.write(stderr_text)
+        return 1
 
     if not initialized:
         sys.stderr.write("no initialize result on stdout\n")
-        sys.stderr.write(f"stdout: {proc.stdout[:2000]}\n")
-        sys.stderr.write(f"stderr: {proc.stderr[:2000]}\n")
+        sys.stderr.write(f"stdout: {stdout_text[:2000]}\n")
+        sys.stderr.write(f"stderr: {stderr_text[:2000]}\n")
         return 1
 
     if served is None:
         sys.stderr.write("server answered initialize but not tools/list\n")
-        sys.stderr.write(f"stdout: {proc.stdout[:2000]}\n")
-        sys.stderr.write(f"stderr: {proc.stderr[:2000]}\n")
+        sys.stderr.write(f"stdout: {stdout_text[:2000]}\n")
+        sys.stderr.write(f"stderr: {stderr_text[:2000]}\n")
         return 1
 
     expected = expected_tool_count()

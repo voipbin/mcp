@@ -57,12 +57,18 @@ async def create_campaign(
     campaign sits idle. Create or look up those resources first and pass their
     UUIDs.
 
+    If you pass queue_id you must also pass a service_level above 0. The server
+    computes how many calls it may have in flight as
+    available_agents * service_level / 100, so the default of 0 yields a
+    capacity of 0 and the campaign never dials despite being fully configured.
+
     Args:
         name: Campaign name.
         detail: Description.
         campaign_type: Type of campaign. One of: call, flow.
         actions: Flow actions to execute for each campaign contact.
         service_level: Target service level percentage, 0-100 (default 0).
+            Must be above 0 whenever queue_id is set; see above.
         end_handle: What to do when the outdial list is exhausted. One of:
             stop, continue.
         outplan_id: UUID of the outplan that defines the dialing schedule.
@@ -70,7 +76,8 @@ async def create_campaign(
         outdial_id: UUID of the outdial list holding the targets. Without it
             the campaign never dials.
         queue_id: UUID of the queue that answered calls are sent to. Without
-            it the campaign never dials.
+            it the campaign never dials. With it, service_level must be
+            above 0.
         next_campaign_id: UUID of the campaign to chain to when this one ends.
     """
     client = get_client()
@@ -117,7 +124,8 @@ async def update_campaign(
         name: Campaign name.
         detail: Description.
         campaign_type: Type of campaign. One of: call, flow.
-        service_level: Target service level percentage, 0-100.
+        service_level: Target service level percentage, 0-100. A campaign with
+            a queue needs this above 0 to dial; see create_campaign.
         end_handle: What to do when the outdial list is exhausted. One of:
             stop, continue.
         fields: Removed in 0.2.0. Pass the named arguments instead.
