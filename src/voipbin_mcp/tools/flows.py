@@ -40,9 +40,10 @@ async def create_flow(name: str, detail: str, actions: list[dict[str, Any]]) -> 
     """Create a new flow with a sequence of actions.
 
     Each action has an id, next_id (for chaining), type, and option object.
-    There are around 40 action types, covering call control (answer, hangup,
-    transfer), media (play, talk, stream_echo), recording, conversation
-    handling, AI agents, queues and branching. An unsupported type is rejected
+    There are around 40 action types, covering call control (answer, hangup),
+    media (play, talk, stream_echo), recording, conversation handling, AI
+    agents, queues and branching. Note that "transfer" is a FLOW type, not an
+    action type, and is rejected here. An unsupported type is rejected
     with a 400 naming the action; consult the VoIPbin API documentation for the
     full list and each type's option schema.
 

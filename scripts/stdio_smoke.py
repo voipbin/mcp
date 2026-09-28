@@ -19,6 +19,7 @@ credentials to start.
 import importlib.metadata
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -50,6 +51,23 @@ def expected_tool_count() -> int:
     if total == 0:
         sys.exit("found no @mcp.tool() decorators; the count would be vacuous")
     return total
+
+
+
+def _signal_group(proc: subprocess.Popen, sig: int) -> None:
+    """Signal the child's whole process group, not just the child.
+
+    A server that forks a helper would otherwise leave the helper running after
+    the direct child is reaped, and the gate would exit 0 with an orphan behind
+    it. Falls back to the single process if the group is already gone.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.send_signal(sig)
+        except ProcessLookupError:
+            pass
 
 
 def main() -> int:
@@ -84,6 +102,9 @@ def main() -> int:
         stderr=subprocess.PIPE,
         text=True,
         env=env,
+        # Own process group, so a server that forks a helper cannot leave the
+        # helper running when we signal: we signal the whole group below.
+        start_new_session=True,
     )
 
     stderr_chunks: list[str] = []
@@ -95,7 +116,7 @@ def main() -> int:
     stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
     stderr_thread.start()
 
-    timer = threading.Timer(60.0, proc.kill)
+    timer = threading.Timer(60.0, lambda: _signal_group(proc, signal.SIGKILL))
     timer.start()
 
     initialized = False
@@ -126,12 +147,17 @@ def main() -> int:
                     sys.stderr.write(f"tools/list returned an error: {line}")
                 break
     finally:
-        # The answer is in hand (or the server died), so nothing more is wanted
-        # from the child. Terminate it rather than waiting for it to notice EOF:
-        # a server that keeps writing after answering would otherwise block on a
-        # full stdout pipe and stall this gate until the kill timer fired, and a
-        # server wedged for any other reason would hold it open too. Ending it
-        # here keeps the gate fast and leaves no process behind.
+        # The answer is in hand (or the server died). Two competing hazards:
+        #
+        #  - Waiting for the server to notice EOF stalls the gate when it keeps
+        #    writing after answering: it blocks on a full 64KB stdout pipe and
+        #    never exits, which used to turn a CORRECT server red.
+        #  - Killing it immediately masks a server that answers and THEN dies.
+        #    That is the exact shape of the 0.1.x failure this gate exists to
+        #    catch, so it must not be traded away for speed.
+        #
+        # Give a dying server a brief window to die visibly, then end it. A
+        # healthy server costs the full window; a crashing one is caught.
         timer.cancel()
         try:
             if proc.stdin is not None:
@@ -139,15 +165,21 @@ def main() -> int:
         except BrokenPipeError:
             pass
 
-        proc.terminate()
         try:
-            proc.wait(timeout=10)
+            proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            pass
+
+        if proc.poll() is None:
+            _signal_group(proc, signal.SIGTERM)
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                sys.stderr.write("server ignored SIGKILL; giving up on reaping it\n")
+                _signal_group(proc, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    sys.stderr.write("server ignored SIGKILL; giving up on reaping it\n")
 
         # Only now close stdout: closing it while the child still runs can hand
         # it an EPIPE that looks like a crash.
@@ -158,12 +190,27 @@ def main() -> int:
                 pass
         stderr_thread.join(timeout=10)
 
+    exit_status = proc.returncode
+
     stderr_text = "".join(stderr_chunks)
     stdout_text = "".join(stdout_lines)
 
     if "Traceback" in stderr_text:
         sys.stderr.write("server raised while handling traffic:\n")
         sys.stderr.write(stderr_text)
+        return 1
+
+    # A server that answers and then dies is broken for any client that holds
+    # the session open -- and not every death prints a traceback (os._exit, a
+    # segfault, a C-level abort). Negative statuses are our own SIGTERM/SIGKILL.
+    if exit_status not in (None, 0, -signal.SIGTERM, -signal.SIGKILL):
+        sys.stderr.write(
+            f"server exited with status {exit_status} after answering. It "
+            "completed the handshake and then died, which breaks any client "
+            "holding the session open.\n"
+        )
+        if stderr_text:
+            sys.stderr.write(f"stderr: {stderr_text[:2000]}\n")
         return 1
 
     if not initialized:

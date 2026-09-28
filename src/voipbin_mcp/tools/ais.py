@@ -59,9 +59,11 @@ async def create_ai(
             what the server validates, so new models from a supported vendor
             work without a release here. Examples: "openai.gpt-4o-mini",
             "anthropic.claude-3-5-sonnet", "gemini.gemini-pro-latest".
-        engine_key: Reference to the API key for the LLM provider. Pass an
-            environment variable reference rather than a literal key; the value
-            is sent to the VoIPbin API and may appear in responses and logs.
+        engine_key: API key for the LLM provider, stored and transmitted
+            verbatim. Nothing expands environment-variable references, so
+            passing "$OPENAI_API_KEY" sends that literal string to the provider
+            and the agent fails to authenticate. The value is returned in API
+            responses and appears in server logs, so treat it as exposed.
         init_prompt: System prompt for the AI agent.
         tts_type: Text-to-speech provider. Examples: google, azure, openai,
             elevenlabs, cartesia, deepgram.

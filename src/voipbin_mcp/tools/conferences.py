@@ -53,7 +53,10 @@ async def create_conference(
             0 means the conference is never auto-deleted. Any other value
             below 60 is replaced by the server default of 86400.
         pre_flow_id: Optional flow ID to execute when a participant joins.
-        post_flow_id: Optional flow ID to execute when a participant leaves.
+        post_flow_id: Stored but NOT executed. The field is accepted and
+            persisted, and the API answers success, but no code path runs it
+            when a participant leaves. Do not rely on it for cleanup work.
+            (pre_flow_id, by contrast, is genuinely executed on join.)
     """
     client = get_client()
     body: dict = {

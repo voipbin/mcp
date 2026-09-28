@@ -26,6 +26,8 @@ from voipbin_mcp.tools.contacts import (
     update_contact_address,
 )
 from voipbin_mcp.tools.emails import send_email
+from voipbin_mcp.tools.flows import create_flow
+from voipbin_mcp.tools.routes import get_route, list_routes
 from voipbin_mcp.server import mcp
 
 
@@ -246,9 +248,65 @@ class TestDocumentedBehaviourMatchesTheBackend:
         # tts_type and stt_type, which listenhandler/main.go:198 maps to
         # simpleResponse(500) -> error_translate.go:94 -> INTERNAL.
         doc = create_ai.__doc__ or ""
-        assert "500" in doc
-        assert "do not retry it unchanged" in doc
-        assert "400 naming the field" not in doc
+        # Pin the DIRECTION, not the tokens: asserting only "500" and a stray
+        # phrase let a mutant say "a 500 is transient, retry it" and still pass.
+        # Whitespace-normalised so rewrapping the docstring does not break it.
+        flat = " ".join(doc.split())
+        assert "treat a 500 from this tool as a rejected argument rather than a transient fault" in flat
+        assert "do not retry it unchanged" in flat
+        assert "400 naming the field" not in flat
+
+    def test_create_ai_does_not_suggest_env_var_references_for_the_key(self):
+        # Nothing in ai-manager or pipecat expands the value: aihandler/db.go
+        # stores engine_key verbatim, so "$OPENAI_API_KEY" is sent literally.
+        flat = " ".join((create_ai.__doc__ or "").split())
+        assert "stored and transmitted verbatim" in flat
+        assert "Nothing expands environment-variable references" in flat
+        assert "Pass an environment variable reference rather than" not in flat
+
+    def test_create_flow_does_not_list_transfer_as_an_action_type(self):
+        # models/action/action.go has no TypeTransfer; models/flow/flow.go:47
+        # does, but that is a FLOW type. actionhandler rejects it with
+        # INVALID_ACTION_TYPE, so listing it as an example hands out a 400.
+        flat = " ".join((create_flow.__doc__ or "").split())
+        assert '"transfer" is a FLOW type, not an action type' in flat
+        # Catch it wherever it is reintroduced, not just in the call-control
+        # group: a mutant that moved it next to the media examples survived an
+        # earlier, position-specific assertion.
+        examples = flat.split("There are around 40 action types", 1)[1].split(
+            "Note that", 1
+        )[0]
+        assert "transfer" not in examples
+
+    def test_create_conference_says_post_flow_id_is_not_executed(self):
+        # grep PostFlowID across the monorepo yields only writes, a filter key
+        # and a webhook echo. conferencecallhandler/terminate.go never reads it,
+        # while service.go:49 does read PreFlowID on join.
+        flat = " ".join((create_conference.__doc__ or "").split())
+        assert "Stored but NOT executed" in flat
+        assert "pre_flow_id, by contrast, is genuinely executed" in flat
+        assert "flow ID to execute when a participant leaves" not in flat
+
+    def test_contact_source_is_documented_as_unvalidated(self):
+        # contacthandler/contact.go:70-71 only defaults "" to manual;
+        # PostContactsJSONBodySource.Valid() has zero non-test callers.
+        flat = " ".join((create_contact.__doc__ or "").split())
+        assert "no layer validates this field" in flat
+        assert "One of: manual, import, api, sync." not in flat
+
+    def test_route_tools_warn_about_the_superadmin_requirement(self):
+        # servicehandler/route.go checks PermissionProjectSuperAdmin, which an
+        # accesskey identity never holds, so these 403 for ordinary customers.
+        for doc in (list_routes.__doc__ or "", get_route.__doc__ or ""):
+            flat = " ".join(doc.split())
+            # Pin BOTH statements: a keyword check on "superadmin" passed even
+            # when one of the two sentences was flipped to "customer permission".
+            assert "Requires project superadmin permission." in flat
+            assert (
+                "answers 403 PERMISSION_DENIED unless your key carries project "
+                "superadmin permission" in flat
+            )
+            assert "Requires customer permission" not in flat
 
 
 class TestNewlyExposedRequiredFields:
