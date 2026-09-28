@@ -65,7 +65,7 @@ def main():
     if transport is not None and transport.strip().lower() not in VALID_AUTH_TRANSPORTS:
         raise SystemExit(
             f"VOIPBIN_AUTH_TRANSPORT must be one of "
-            f"{', '.join(VALID_AUTH_TRANSPORTS)}; got {transport!r}. "
+            f"{', '.join(sorted(VALID_AUTH_TRANSPORTS))}; got {transport!r}. "
             "Leave it unset to send the key as a cookie."
         )
 
