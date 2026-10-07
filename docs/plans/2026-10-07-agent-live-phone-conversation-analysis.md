@@ -161,3 +161,26 @@ Claude Code 같은 외부 AI agent가 VoIPBin MCP 서버의 tool만으로 직접
 - extension 목적지는 groupcall 경유 call_id 조회가 필요.
 - mcp 의존성 하한을 1.3.0 이상(권장: 검증한 최신 계열)으로 상향.
 - 턴 지연 합계 추정: 사람 발화 종료→transcript 약 1초 + agent 추론 약 2초 + TTS 첫 오디오 약 1초 = 약 4초.
+
+## 10. 범위 변경과 수신 통화 실측 (2026-10-07)
+
+대표님 결정:
+- 최대 통화 시간: 요구는 최대 24시간, 기본 1시간. 백엔드 1시간 하드코딩(`bin-call-manager/pkg/callhandler/main.go:177`) 때문에 이번 작업은 기본 1시간, 상한 1시간(상수)으로 구현하고 24시간은 후속 VOIP-1575로 분리.
+- 자동 맞장구 제외.
+- 수신 통화를 범위에 포함(/ws listen 방식). tool 구성 확정.
+
+수신 실측 방법: 임시 virtual number(무과금, `CreateVirtual`은 provider 구매/과금 없음, 리소스 한도만 검사)와 임시 flow를 만들고, 외부 SIP UA(sipp, 무인증)로 `sip:<virtual number>@sip.voipbin.net`에 INVITE. 컨트롤러는 /ws `call:call_created` 등을 구독. 실험 후 number, flow 삭제 확인(1회는 수동 정리).
+
+| 항목 | 결과 |
+|---|---|
+| 수신 감지 | `call_created`(direction=incoming, status=ringing, destination.target=번호)로 INVITE 후 약 0.3~0.5초에 감지. |
+| answer 없는 flow(`sleep`만) | 채널은 ringing 유지, 발신자에게는 100 Trying만 전송(180 Ringing 없음). |
+| MCP 응답 | `POST /calls/{id}/talk`가 미응답 통화를 먼저 Answer한 뒤 재생 → 발신자에게 200 OK, call_progressing 이벤트. API 0.2~0.45초. |
+| 응답 전 STT/TTS 생성 | 생성 API는 성공(progressing/active)하지만 **응답 후 전사도 TTS도 동작하지 않음**. → STT/TTS는 반드시 응답 후 생성. |
+| 응답 후 STT/TTS | 정상. talk 인사, speaking say 2회 모두 발신자 RTP로 수신, 발신자 음성 2문장 모두 transcript_created(aws). |
+| MCP 부재(응답 안 함) | **sleep 20초가 지나도 통화가 ringing으로 계속 남음**(2분 이상 관찰 후 수동 hangup). 원인 미확인(미응답 수신 채널에서 sleep timeout이 다음 action으로 진행하지 않는 것으로 보임, 백엔드 동작). 실제 PSTN 발신자는 통신사 무응답 타임아웃까지 대기하게 됨. |
+
+설계 함의:
+- 수신 흐름: 번호의 call flow = answer 없는 `sleep`(대기 상한) flow. MCP는 `call_created`(incoming, 대상 번호) 감지 → `/calls/{id}/talk`로 응답(짧은 인사) → STT(aws, in)/TTS(out) 생성 → 대화.
+- MCP 부재 시 발신자가 무음 회선에 잡히지는 않음(응답 자체가 안 됨). 단 미응답 수신 통화가 sleep 이후에도 정리되지 않는 백엔드 동작이 있어, MCP 쪽 보완(대기 tool이 감지했으나 처리하지 않는 통화는 hangup)과 별도 백엔드 확인이 필요.
+- 미응답 상태에서 180 Ringing이 없어 발신자가 링백톤을 못 들을 수 있음(UA/통신사 의존).
