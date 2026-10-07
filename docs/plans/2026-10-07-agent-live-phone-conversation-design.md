@@ -96,10 +96,10 @@ VoIPBin REST (기존 VoIPbinClient 재사용) + wss /ws
 - speaking 세션이 없으면(barge-in으로 stop된 경우) 새로 생성 후 say.
 
 끊기(barge-in):
-- 실행 주체: EventHub의 라우팅 콜백(백그라운드)이 판정한다. WS 수신 루프를 막지 않도록 HTTP를 직접 await하지 않는다. 판정 시 순서: (1) `old_id = speaking_id` 캡처, (2) 즉시 `speaking_id=None`, `speaking_until=now`, (3) `old_id`로 stop을 수행하는 task를 생성해 세션의 `pending_stop`에 보관. 세션 lock은 잡지 않는다. 다음 say는 (세션 lock 안에서) `pending_stop`이 있으면 먼저 await한 뒤(이전 speaking이 active로 남아 생성 거부되는 것 방지, `bin-tts-manager/pkg/speakinghandler/speaking.go:38-54`), `speaking_id`가 None이면 새 세션을 만든다. 세션에 `barge_gen` 카운터를 두고 barge-in 판정마다 1 증가시킨다. say는 시작 시 세대를 캡처하고, 조각을 보낼 때마다 세대가 바뀌었으면 남은 조각 전송을 중단한다. 세대가 바뀐 뒤에는 어떤 재시도도 하지 않는다(상대가 끼어든 뒤 agent가 다시 말하는 것 방지). 재시도는 세대가 같고 speaking 생성이 '이미 active' 오류로 거부된 경우(stop task 실패로 이전 speaking이 남음, `speaking.go:38-54`)에만 stop 재시도 후 생성 1회 재시도로 한정한다.
+- 실행 주체: EventHub의 라우팅 콜백(백그라운드)이 판정한다. WS 수신 루프를 막지 않도록 HTTP를 직접 await하지 않는다. 판정 시 순서: (1) `old_id = speaking_id` 캡처, (2) 즉시 `speaking_id=None`, `speaking_until=now`, (3) `old_id`로 stop을 수행하는 task를 생성해 세션의 `pending_stop`에 보관. 세션 lock은 잡지 않는다. 다음 say는 (세션 lock 안에서) `pending_stop`이 있으면 먼저 await한 뒤(이전 speaking이 active로 남아 생성 거부되는 것 방지, `bin-tts-manager/pkg/speakinghandler/speaking.go:38-54`), `speaking_id`가 None이면 새 세션을 만든다. 세션에 `barge_gen` 카운터를 두고 barge-in 판정마다 1 증가시킨다. say는 시작 시 세대를 캡처하고, 조각을 보낼 때마다 세대가 바뀌었으면 남은 조각 전송을 중단한다. 세대가 바뀐 뒤에는 어떤 재시도도 하지 않는다(상대가 끼어든 뒤 agent가 다시 말하는 것 방지). 세션은 stop 미확인 id 목록 `stale_speaking_ids`를 유지한다(barge-in 시 old_id 추가, stop 성공 시 제거). 재시도는 세대가 같고 speaking 생성이 '이미 active' 오류로 거부된 경우(`speaking.go:38-54`)에만, `stale_speaking_ids` 전체에 stop을 재시도한 뒤 생성 1회 재시도로 한정한다.
 - 오탐 완화: interim message가 2단어 이상 또는 4자 이상일 때만 끼어듦으로 본다.
 - `barge_in` 설정은 세션 속성으로 유지되며 say/say_and_listen 호출 시 인자로 갱신한다.
-- 판정 조건: 판정 창은 `say_at + 1.0초`부터 `speaking_until`까지(실측상 say 후 첫 오디오까지 0.9~1.3초, 그 전 interim은 agent 음성을 듣기 전에 시작된 발화). 이 창에서 `InterimEvent`(위 길이 조건 충족)가 오면 끼어듦으로 보고 위 순서로 정리한다(실측: 새 speaking 생성+say 0.6초, 첫 오디오까지 추가 0.3~0.9초). 수신 인사(`talk`) 재생 구간은 speakings로 멈출 수 없으므로 barge-in 판정에서 제외하고 `during_agent_speech` 표시에만 쓴다.
+- 판정 조건: 판정 창은 `say_at + 1.0초`(`say_at`은 speaking_until이 비어 있던 상태에서 시작한 첫 say의 시각, 연속 say는 창을 연장만 함)부터 `speaking_until`까지(실측상 say 후 첫 오디오까지 0.9~1.3초, 그 전 interim은 agent 음성을 듣기 전에 시작된 발화). 이 창에서 `InterimEvent`(위 길이 조건 충족)가 오면 끼어듦으로 보고 위 순서로 정리한다(실측: 새 speaking 생성+say 0.6초, 첫 오디오까지 추가 0.3~0.9초). 수신 인사(`talk`) 재생 구간은 speakings로 멈출 수 없으므로 barge-in 판정에서 제외하고 `during_agent_speech` 표시에만 쓴다.
 - 보고: barge-in이 일어나면 세션의 `unreported_barge_in`을 세운다. 다음 say, say_and_listen, listen 결과 중 먼저 반환되는 것에 `barge_in: true`로 1회 노출하고 지운다(`phone_say(wait=false)` 반환 후 발생한 barge-in도 agent에게 전달).
 - 자동 barge-in은 `barge_in` 인자로 끌 수 있다(기본 켜짐). 끄면 agent 말을 끝까지 재생하고 그 사이 상대 발화는 그대로 전사·버퍼링된다.
 
@@ -107,9 +107,10 @@ VoIPBin REST (기존 VoIPbinClient 재사용) + wss /ws
 - 버퍼에 이미 transcript가 있으면 그것부터 사용. say_and_listen에서는 say 이전에 쌓인 잔여 transcript를 `earlier_heard` 필드로 분리해 반환하고 `heard`에는 say 이후 발화만 넣는다.
 - 첫 transcript 수신 후 `end_silence`(기본 0.8초) 동안 새 transcript나 interim이 없으면 턴 종료로 보고, 버퍼의 transcript를 공백으로 이어 반환한다(한 발화가 여러 transcript로 쪼개지는 실측 반영).
 - interim이 오고 있으면 턴 종료를 미룬다(상대가 아직 말하는 중).
-- `timeout`(기본 30초, 상한 120초) 안에 아무 transcript도 없으면 `heard: ""`, `timed_out: true`. 단 timeout 시점에 interim이 진행 중이면 최대 5초 연장해 발화 확정을 기다린다.
+- `timeout`(기본 30초, 상한 120초) 안에 아무 transcript도 없으면 `heard: ""`, `timed_out: true`. timeout으로 끝날 때 세션 `reconcile()`을 1회 실행해 서버 구독 버퍼 drop으로 잃은 transcript를 회수한다(transcript id dedupe). 단 timeout 시점에 interim이 진행 중이면 최대 5초 연장해 발화 확정을 기다린다.
 - `end_silence_ms` 범위 300~3000.
 - timeout 기준점: say_and_listen에서는 `max(now, speaking_until)`부터 `listen_timeout`을 센다(긴 발화 중에 timeout이 소모되지 않게). say_and_listen 전체 블로킹은 150초를 넘지 않는다(추정 발화 시간이 길면 listen 구간을 줄임).
+- 발화가 긴 경우: say_and_listen에서 추정 발화 종료가 150초 상한 이후면 listen 없이 `still_speaking: true`로 반환한다(agent는 phone_listen으로 이어 듣는다). `phone_say(wait=true)`의 대기도 120초 상한이며 넘으면 `still_speaking: true`로 반환한다.
 - 전체 대기 상한: 어떤 경우에도 기준점 + `timeout + 5초`를 넘기지 않는다. 배경 소음이나 긴 독백으로 interim/transcript가 계속 오면 상한 시점까지의 버퍼를 `heard`로 반환하고 `truncated: true`를 표시하며, 이후 발화는 다음 listen으로 넘긴다.
 - 통화가 끝나면 즉시 남은 버퍼와 함께 `call_ended: true`로 반환.
 - agent가 말하는 도중(`speaking_until` 이전)에 확정된 transcript는 `during_agent_speech: true`로 표시한다(스피커폰 에코 판단 보조).
@@ -129,10 +130,10 @@ VoIPBin REST (기존 VoIPbinClient 재사용) + wss /ws
     "actions": [{"type": "sleep", "option": {"duration": <max_duration_ms>}}]}
    ```
    destination_type=extension이면 `{"type": "extension", "target_name": "<v>"}`(실측: `target`이 아니라 `target_name`).
-4. 취소 안전 등록: POST /calls 요청과 그 응답으로 `pending` 세션(`call_id` 또는 `groupcall_id`)을 등록하는 구간 전체를 `with anyio.CancelScope(shield=True):`로 감싼다(POST가 서버에서 성공했는데 등록이 없는 상태 방지). 이후 어느 단계에서든 취소(Claude Code Esc의 `notifications/cancelled`, mcp 1.27 EOF 취소)나 예외가 나면 4.7의 정리 규칙으로 hangup 후 재전파한다. 정리 대상: call_id 확정 후에는 `POST /calls/{id}/hangup`, 확정 전에는 `POST /groupcalls/{id}/hangup`(그 groupcall의 call_ids와 groupcall_ids를 모두 끊음, `bin-call-manager/pkg/groupcallhandler/hangup.go:46-76`). ringall은 call_ids를 먼저 할당하고 통화를 goroutine으로 생성하므로(`groupcallhandler/start.go:126-160`) 같은 shield 안에서 약 1초 뒤 `GET /groupcalls/{id}`의 call_ids를 개별 `POST /calls/{id}/hangup`(404 무시)으로 한 번 더 끊는다.
+4. 취소 안전 등록: POST /calls 요청과 그 응답으로 `pending` 세션(`call_id` 또는 `groupcall_id`)을 등록하는 구간 전체를 `with anyio.CancelScope(shield=True):`로 감싼다(POST가 서버에서 성공했는데 등록이 없는 상태 방지). 이후 어느 단계에서든 취소(Claude Code Esc의 `notifications/cancelled`, mcp 1.27 EOF 취소)나 예외가 나면 4.7의 정리 규칙으로 hangup 후 재전파한다. 정리 대상: call_id 확정 후에는 `POST /calls/{id}/hangup`, 확정 전에는 `POST /groupcalls/{id}/hangup`(그 groupcall의 call_ids와 groupcall_ids를 모두 끊음, `bin-call-manager/pkg/groupcallhandler/hangup.go:46-76`). call 생성이 goroutine으로 진행되므로(`bin-call-manager/pkg/groupcallhandler/start.go:344-362` `startWithDestination`) 정리용 `move_on_after(5, shield=True)` 안에서 0.5초 간격으로 `GET /groupcalls/{id}`의 call_ids를 조회해 hangup이 아닌 call을 개별 `POST /calls/{id}/hangup`(404 무시)으로 끊고, 모두 hangup이거나 404가 되면 멈춘다.
 5. call_id 확정:
    - 응답 `calls[0].id`가 있으면 그것.
-   - 없으면 groupcall: `GET /groupcalls/{id}`를 0.25초 간격으로 polling하며 `call_ids` 전체를 후보 집합으로 유지(ring 방식이 linear면 점진적으로 늘어남). 후보 중 처음 `call_progressing`이 온 call을 확정하고, 보조로 `answer_call_id`를 확인한다. 실패 판정은 `GET /groupcalls/{id}`의 status가 hangup인 경우로 한다(linear 방식에서 후보가 점진적으로 늘어나므로 후보 전원 hangup 기준은 너무 이름). 중첩 groupcall(`call_ids`가 비어 있고 `groupcall_ids`만 있음)은 추적하지 않고 groupcall hangup 후 명시적 오류로 반환한다.
+   - 없으면 groupcall: 후보 집합은 POST 응답 `groupcalls[0].call_ids`(extension은 항상 RingAll이고 call_ids는 `Create`에서 확정되어 `createCallsOutgoingGroupcall`의 동기 `Start` 이후 응답에 포함, `bin-call-manager/pkg/groupcallhandler/dial.go:158-159`, `pkg/callhandler/outgoing_call.go:530`). 비어 있을 때만 `GET /groupcalls/{id}` 1회로 보완. 후보 중 처음 `call_progressing`이 온 call을 확정하고, 보조로 `answer_call_id`를 확인한다. 실패 판정은 groupcall status hangup 또는 후보 전원 hangup. destination_type이 {tel, sip, extension}으로 제한되므로 linear ring과 중첩 groupcall은 발생하지 않아 다루지 않는다.
    - 응답 대기: 보관 버퍼와 이후 이벤트에서 `call_progressing` 대기, 보조로 1초마다 GET. 단일 call이 `call_hangup`이면 `hangup_reason`과 함께 실패 반환. `answer_timeout` 초과면 4의 정리 경로로 hangup 후 `no_answer`.
 6. `start_media()`. 실패 시 hangup 후 오류.
 7. 결과: `{call_id, status: "answered", max_duration_seconds, hint}`.
@@ -146,6 +147,7 @@ VoIPBin REST (기존 VoIPbinClient 재사용) + wss /ws
   2. 그 flow가 이미 MCP flow(`GET /flows/{id}`의 detail 마커 확인)면 아무것도 바꾸지 않고 detail의 `previous_call_flow_id`를 그대로 반환한다(재호출해도 원래 flow를 잃지 않음).
   3. 아니면 `POST /flows {name, detail, actions: [{"type":"sleep","option":{"duration":3600000}}]}`(answer 없음)로 만들고 `PUT /numbers/{id}/flow_ids {call_flow_id}`(부분 갱신, message_flow_id 유지)로 연결한다. PUT이 실패하면 방금 만든 flow를 삭제한다.
 - `enabled=false`:
+  0. 이 프로세스에 해당 번호의 대기자나 활성 수신 세션이 있으면 오류(먼저 대기 종료 또는 통화 종료 필요).
   1. 현재 flow가 MCP flow가 아니면 오류(이미 해제됨).
   2. 복원 대상: `restore_call_flow_id`가 있으면 그것, 없으면 detail의 `previous_call_flow_id`. 저장값이 nil이면 `clear=true`가 명시된 경우에만 `"00000000-0000-0000-0000-000000000000"`을 보내 해제하고(JSON null이나 생략은 무변경), 아니면 오류(조용한 수신 라우팅 해제 방지). number-manager는 flow 존재를 검증하지 않으므로 복원 전에 `GET /flows/{prev}`로 존재를 확인하고, 없으면 오류.
   3. `PUT /numbers/{id}/flow_ids`로 복원 후 MCP flow 삭제.
@@ -158,7 +160,7 @@ VoIPBin REST (기존 VoIPbinClient 재사용) + wss /ws
 3. 감지 즉시 `pending` 세션 등록(4.7 규칙, 정리 수단은 `POST /calls/{id}/hangup`).
 4. `POST /calls/{id}/talk {text: greeting, language: greeting_language}`로 응답 겸 인사. talk는 gcp/aws 음성 체계라 speakings(ElevenLabs)의 `voice_id`를 넘기지 않는다. greeting은 비울 수 없다(talk가 응답 수단). 인사 추정 재생 시간은 `greeting_until`로 별도 보관해 `during_agent_speech` 표시에만 쓴다(barge-in 판정 대상 아님, 4.2).
 5. `call_progressing` 확인(최대 5초, 보조 GET) 후 `start_media()`(응답 후 생성 규칙).
-6. 3~5 중 어느 단계든 실패/취소 시 4.7 규칙으로 `POST /calls/{id}/hangup` 후 오류 반환.
+6. 우선순위: talk 실패 후 `GET /calls/{id}`의 status가 hangup이거나 404면 2단계 규칙(남은 timeout 안에서 계속 대기)을 따른다. 그 외 3~5단계 실패/취소는 4.7 규칙으로 `POST /calls/{id}/hangup` 후 오류 반환.
 7. 결과: `{call_id, status: "answered", caller: source}`.
 
 대기자 없는 수신 통화(분석 10절 설계 함의): 판정은 `call_created` payload의 `flow_id`(수신 통화에는 번호의 call_flow_id가 들어감, `bin-call-manager/pkg/callhandler/start.go:609,679-690`)가 이 프로세스가 `phone_wait_incoming`에서 매칭 키로 사용한 적이 있는 MCP flow id 집합(로컬 집합, 추가 API 조회 없음)에 속하는 경우로만 한다(발신 전용 프로세스는 거절하지 않음). 조건을 만족하는 incoming ringing 통화가 `UNCLAIMED_INCOMING_GRACE_SECONDS = 15` 안에 대기자에게 잡히지 않으면, 만료 시점에 `GET /calls/{id}`의 status가 `ringing`일 때만 `POST /calls/{id}/hangup`으로 거절한다. 해당 call의 `call_progressing` 또는 `call_hangup`을 받으면 타이머를 취소한다(다른 프로세스가 응답한 통화를 끊지 않음). 새 대기자는 grace 안에 남아 있는 미청구 ringing 통화를 먼저 가져간다(대기 tool 재호출 사이 공백 흡수). MCP 프로세스가 없으면 거절 주체도 없으므로 백엔드 동작(채널 1시간 timeout, `bin-call-manager/pkg/callhandler/start.go:230-241`)에 맡긴다(D6).
@@ -178,7 +180,7 @@ VoIPBin REST (기존 VoIPbinClient 재사용) + wss /ws
 |---|---|
 | 1 | 최대 길이 타이머: `deadline` 도달 시 MCP가 hangup. |
 | 2 | 무활동 watchdog: 세션에 대한 tool 호출이 `IDLE_HANGUP_SECONDS = 300`(상수) 동안 없으면 hangup. listen 대기 중은 활동으로 본다. |
-| 3 | 정상 종료: (a) SIGTERM/SIGINT: 첫 phone tool 호출 시 실행 중 loop에 `loop.add_signal_handler`를 등록한다(anyio 아래 동작 확인). handler는 정리 task를 만들어 전 세션 hangup을 병렬로 실행하되 전체 5초 상한(`move_on_after(5, shield=True)`) 후 `os._exit(128+signum)`으로 종료한다. 정리 중 두 번째 시그널은 무시한다. Python 기본 SIGTERM은 finally 없이 종료하므로 필수이고, SIGINT 등록 시 KeyboardInterrupt 기본 동작이 사라지는 것은 의도된 대체다. phone tool을 한 번도 쓰지 않은 프로세스는 등록하지 않아 기존 동작 불변. (b) stdin EOF: mcp 1.27.0부터 EOF 시 진행 중 핸들러를 취소한다(`lowlevel/server.py:690` `tg.cancel_scope.cancel()`, 1.26 이하에는 없음 확인). 취소된 tool은 4.7 규칙으로 자기 통화를 끊고, `main()`은 `mcp.run()` 대신 `anyio.run(_serve)`를 쓰고 `_serve`는 `try: await mcp.run_stdio_async() finally:`에서 같은 loop와 기존 client로 남은 세션을 병렬 hangup(전체 5초, shield)한다(새 loop를 만들지 않으므로 signal handler 공백 구간 없음). 세션이 없으면 finally는 client 생성이나 네트워크 없이 즉시 끝나는 no-op이어야 한다(기존 `scripts/stdio_smoke.py`, `scripts/fault_matrix.py` 종료 검증 유지). |
+| 3 | 정상 종료: (a) SIGTERM/SIGINT: 첫 phone tool 호출 시 실행 중 loop에 `loop.add_signal_handler`를 등록한다(anyio 아래 동작 확인). handler는 정리 task를 만들어 전 세션 hangup을 병렬로 실행하되 전체 5초 상한(`move_on_after(5, shield=True)`) 후 `os._exit(128+signum)`으로 종료한다. 정리 중 두 번째 시그널은 무시한다. Python 기본 SIGTERM은 finally 없이 종료하므로 필수이고, SIGINT 등록 시 KeyboardInterrupt 기본 동작이 사라지는 것은 의도된 대체다. phone tool을 한 번도 쓰지 않은 프로세스는 등록하지 않아 기존 동작 불변. (b) stdin EOF: mcp 1.27.0부터 EOF 시 진행 중 핸들러를 취소한다(`lowlevel/server.py:690` `tg.cancel_scope.cancel()`, 1.26 이하에는 없음 확인). 취소된 tool은 4.7 규칙으로 자기 통화를 끊고, `main()`은 `mcp.run()` 대신 `anyio.run(_serve)`를 쓰고 `_serve`는 `try: await mcp.run_stdio_async() finally:`에서 같은 loop와 기존 client로 남은 세션을 병렬 hangup(전체 5초, shield)한다(새 loop를 만들지 않으므로 signal handler 공백 구간 없음). 세션이 없으면 finally는 client 생성이나 네트워크 없이 즉시 끝나는 no-op이어야 한다(기존 `scripts/stdio_smoke.py`, `scripts/fault_matrix.py` 종료 검증 유지). 종료 정리 대상에는 활성 세션 외에 pending(groupcall_id만 있는) 세션과 grace 중인 미청구 수신 ringing 통화(status ringing일 때만)도 포함한다. SessionManager는 진행 중 POST /calls 수를 세고, 종료 정리는 5초 예산 안에서 그 등록 완료를 기다린 뒤 hangup한다. |
 | 4 | 최종 backstop: SIGKILL 등으로 위 장치가 모두 실패하면 발신은 `sleep`(max_duration) 후 서버가 종료, 수신은 flow sleep(1시간) 후 종료. |
 
 watchdog과 deadline은 EventHub와 분리된 supervisor task에서 1초 주기로 검사한다(EventHub가 재연결 중이거나 죽어도 동작). 백그라운드 task 참조는 SessionManager가 강하게 보유하고, lazy start는 `asyncio.Lock`으로 1회만 실행한다. supervisor는 EventHub task가 예외로 끝나면(`done()` 감지) 재시작한다. EventHub가 죽어 재시작 중이면 tool 결과에 `events_connected: false`를 노출한다.
@@ -198,11 +200,11 @@ FastMCP/mcp는 anyio cancel scope로 handler를 취소하며, scope가 취소된
 
 | tool | 인자 | 동작 | 반환 |
 |---|---|---|---|
-| `phone_call_start` | `source_number`, `destination_type`, `destination_target`, `language="en-US"`, `voice_id=""`, `max_duration_seconds=3600`, `answer_timeout_seconds=60` | 4.3 | `call_id`, `status` |
+| `phone_call_start` | `source_number`, `destination_type`, `destination_target`, `language="en-US"`, `voice_id=""`, `max_duration_seconds=3600`, `answer_timeout_seconds=60` | 4.3 | `call_id`, `status`, `max_duration_seconds`, `hint` |
 | `phone_incoming_configure` | `number_id`, `enabled`, `restore_call_flow_id=""`, `clear=false` | 4.4 | `number`, `call_flow_id`, `previous_call_flow_id` |
 | `phone_wait_incoming` | `number_id`, `timeout_seconds=300`, `greeting="Hello."`, `greeting_language="en-US"`, `language="en-US"`, `voice_id=""`, `max_duration_seconds=3600` | 4.4 | `call_id`, `caller`, `status` 또는 `timed_out` |
-| `phone_say_and_listen` | `call_id`, `text`, `listen_timeout_seconds=30`, `end_silence_ms=800`, `barge_in=true` | say 후 listen. 1턴 = 1호출 | `heard`, `earlier_heard`, `barge_in`, `timed_out`, `truncated`, `call_ended`, `during_agent_speech`, `stt_silent_seconds?`, `events_connected` |
-| `phone_say` | `call_id`, `text`, `wait=false`, `barge_in=true` | say. `wait=true`면 `speaking_until`까지(또는 barge-in까지) 대기 | `queued`, `estimated_seconds`, `barge_in?` |
+| `phone_say_and_listen` | `call_id`, `text`, `listen_timeout_seconds=30`, `end_silence_ms=800`, `barge_in=true` | say 후 listen. 1턴 = 1호출 | `heard`, `earlier_heard`, `still_speaking?`, `barge_in`, `timed_out`, `truncated`, `call_ended`, `during_agent_speech`, `stt_silent_seconds?`, `events_connected` |
+| `phone_say` | `call_id`, `text`, `wait=false`, `barge_in=true` | say. `wait=true`면 `speaking_until`까지(또는 barge-in까지) 대기 | `queued`, `estimated_seconds`, `barge_in?`, `still_speaking?` |
 | `phone_listen` | `call_id`, `timeout_seconds=30`, `end_silence_ms=800` | listen | `heard`, `barge_in`, `timed_out`, `truncated`, `call_ended`, `during_agent_speech`, `stt_silent_seconds?`, `events_connected` |
 | `phone_hangup` | `call_id` | 4.2 종료 | `status: ended` |
 | `phone_status` | `call_id=""` | 하나 또는 전체 세션 요약 | 상태, 경과, 남은 시간, 버퍼 transcript 수, `events_connected` |
@@ -242,8 +244,9 @@ websockets 버전: `additional_headers` 인자를 쓰는 신규 asyncio client(`
 - tools: 발신 body(sleep duration ms, extension의 target_name), groupcall call_id polling, answer_timeout hangup, 수신 매칭(다른 번호/outgoing 무시), greeting 빈 값 거부, 대기자 중복 거부, MAX_SESSIONS, 인자 범위 위반 시 무호출, incoming_configure의 previous flow 반환과 원복.
 - manager: idle watchdog, deadline, shutdown 시 전 세션 hangup, supervisor가 EventHub 장애와 독립 동작, 세션 없을 때 main finally no-op.
 - 취소: anyio task group `cancel_scope.cancel()`로 반복 취소를 재현해, `phone_call_start`가 POST 중/직후/응답 대기 중 취소되면 hangup(call_id 확정 후는 calls hangup, 전은 groupcalls hangup), `phone_wait_incoming`이 talk 이후 취소되면 hangup이 실제로 전송되는지 검증.
-- groupcall: 두 번째 leg가 응답한 경우 그 leg로 확정, groupcall status hangup일 때만 실패, 확정 전 취소 시 groupcall hangup 후 call_ids 개별 hangup 재시도.
+- groupcall: 두 번째 leg가 응답한 경우 그 leg로 확정, groupcall status hangup 또는 후보 전원 hangup 시 실패, 확정 전 취소 시 groupcall hangup 후 call_ids 개별 hangup 반복(모두 종료까지).
 - 한도: 동시 phone_call_start 2건이 슬롯 예약으로 한도를 넘지 않음, 종료 세션 60초 보존.
+- 기타: 수신 talk 실패 후 call hangup이면 계속 대기, 활성 수신 중 configure(enabled=false) 오류, stale_speaking_ids 재시도, 긴 발화 still_speaking, listen timeout 시 reconcile, SIGTERM 시 진행 중 POST 완료 대기 후 hangup과 미청구 수신 통화 정리.
 - 수신: flow_id가 다르고 destination만 같은 통화 무시, 인수 통화 talk 실패 시 다음 통화 계속 대기, 대기자 없는 incoming은 grace 후 status ringing일 때만 hangup, progressing/hangup 수신 시 타이머 취소, 발신 전용 프로세스는 거절 안 함, MCP flow가 아닌 flow_id 통화 무시, 새 대기자의 미청구 통화 인수, configure 재호출 시 previous 보존, disable 시 detail 복원과 MCP flow 삭제, 저장값 nil이면 clear 없이 오류.
 - 시간 의존 테스트는 시계와 상수(end_silence, grace, idle)를 주입해 결정적으로 만든다.
 - `tools/phone.py`는 정확히 `@mcp.tool()` 표기를 써서 기존 등록 카운트 테스트를 통과한다. docstring의 백엔드 사실(응답 후 STT/TTS 생성, 미응답 수신 잔존 등)은 repo 관례대로 `PINNED_CLAIMS`에 Go 근거와 함께 고정한다.
@@ -261,13 +264,14 @@ websockets 버전: `additional_headers` 인자를 쓰는 신규 asyncio client(`
 - 비용: 통화, STT, TTS 과금. 호스티드 환경의 PSTN 발신 제한은 기존 정책을 따른다.
 - 프로세스 강제 종료 시 통화는 최대 길이까지 남을 수 있다.
 
-## 9. 미결 사항 (리뷰어 판단 요청)
+## 9. 미결 사항 (결정됨)
 
-1. 단일 WS 연결 + payload 형태 판별 vs 이벤트 타입별 연결 분리. 본 설계는 단일 연결(구독 topic을 5개로 한정하여 판별 모호성 제거).
-2. `MAX_SESSIONS = 4`, `IDLE_HANGUP_SECONDS = 300`, `UNCLAIMED_INCOMING_GRACE_SECONDS = 15` 기본값의 타당성.
-3. `phone_incoming_configure`가 번호의 기존 flow를 대체하는 방식의 안전성.
+1. 단일 WS 연결 + payload 형태 판별: 채택(Round 1, 4 리뷰어 동의).
+2. `MAX_SESSIONS = 4`, `IDLE_HANGUP_SECONDS = 300`, `UNCLAIMED_INCOMING_GRACE_SECONDS = 15`: 채택.
+3. configure의 flow 대체: 마커 flow, previous 보존, 한 번호당 MCP 프로세스 1개 규칙(README)으로 채택.
 
 ## 10. 리뷰 이력
 - Round 1: CHANGES_REQUESTED. MAJOR 7(stt_warning 무효, mcp 1.6~1.26 EOF 종료 정리 불성립과 SIGTERM, tool 취소 시 고아 통화, groupcall 다중 leg, configure의 설정 유실, 대기자 없는 수신 통화, 수신 부분 실패 정리와 voice_id 체계 혼용), MINOR 10. 전부 반영.
 - Round 2: CHANGES_REQUESTED. MAJOR 3(anyio 반복 취소로 asyncio.shield 정리 불성립, 대기자 없는 수신 거절이 타 프로세스 응답 통화를 끊을 위험, listen 전체 상한 부재), MINOR 8(barge-in 순서와 pending_stop, clear의 nil UUID와 flow 존재 확인, CI 경로 dist-smoke.yml, SIGTERM 종료 방식과 finally no-op, 중첩 groupcall, 미청구 통화 인수, tool 표 반환 필드, transcript 보관 버퍼 제거). 전부 반영.
 - Round 3: CHANGES_REQUESTED. MAJOR 2(4.1과 4.4 수신 매칭 규칙 불일치 및 destination 보조 매칭의 가로채기 위험, barge-in 이후 재시도/다중 조각으로 agent 발화 재개와 미보고 barge-in), MINOR 10(판정 창 시작과 talk 구간 제외, listen 기준점, groupcall hangup race, linear 실패 판정, 슬롯 예약, run_stdio_async 기반 종료 단순화, supervisor 재시작과 종료 세션 보존, 마커 조회 제거, 인수 실패 처리, 절 순서와 anyio 대기). 전부 반영.
+- Round 4: APPROVED. MINOR 9(수신 talk 실패 우선순위, groupcall 과설계 축소, 재-hangup shield와 인용 위치, stale_speaking_ids, 긴 발화 still_speaking, SIGTERM 진행 중 POST와 미청구 통화, 활성 수신 중 disable, listen timeout reconcile, 표 정합성과 9절 종결). 전부 반영.
