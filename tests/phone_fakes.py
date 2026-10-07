@@ -61,6 +61,7 @@ def fast_config(**overrides) -> PhoneConfig:
         interim_active_seconds=0.2,
         unclaimed_incoming_grace_seconds=0.15,
         events_ready_timeout=0.5,
+        reconcile_timeout=0.5,
         estimate_seconds=lambda text: 0.2,
     )
     values.update(overrides)
@@ -110,6 +111,35 @@ async def settle(manager: SessionManager, rounds: int = 3) -> None:
 
 def ok(payload=None, status=200):
     return httpx.Response(status, json=payload if payload is not None else {})
+
+
+def yielding(response=None, delay=0.01, entered: asyncio.Event | None = None):
+    """An async respx side effect that awaits before answering.
+
+    A synchronous mock answers without ever reaching an await, so a request
+    made under a cancelled (unshielded) scope still "succeeds" and a
+    cancellation test cannot tell a shielded cleanup from an unshielded one.
+    This one yields to the loop first: an unshielded request is cancelled
+    there and, because respx records a call only once it has a response, it
+    then does not show up in ``route.call_count``.
+
+    ``response`` is an httpx.Response, a callable ``request -> Response``, or
+    None for an empty 200. ``entered`` is set when the request arrives.
+    """
+
+    async def handler(request):
+        if entered is not None:
+            entered.set()
+        await asyncio.sleep(delay)
+        if callable(response):
+            return response(request)
+        return response if response is not None else ok()
+
+    return handler
+
+
+def yielding_ok(payload=None, delay=0.01, entered: asyncio.Event | None = None):
+    return yielding(lambda request: ok(payload), delay, entered)
 
 
 def err(status, message="boom", reason="ERR"):

@@ -274,9 +274,13 @@ async def phone_say_and_listen(
             result["earlier_heard"] = ""
             return format_response(result)
         config = session.config
+        # The 130 s cap covers the whole tool call, including the wait for
+        # another tool holding the session lock, and keeps the listen's
+        # reconcile budget inside it.
+        started = session.clock()
+        hard_end = started + config.say_and_listen_max_block - config.reconcile_timeout
         with session.activity():
             async with session.lock:
-                started = session.clock()
                 earlier = " ".join(item["message"] for item in session.drain())
                 try:
                     await session.say(text, bool(barge_in))
@@ -287,7 +291,6 @@ async def phone_say_and_listen(
                     result["earlier_heard"] = earlier
                     return format_response(result)
                 start_at = max(session.clock(), session.speaking_until)
-                hard_end = started + config.say_and_listen_max_block
                 if start_at >= hard_end:
                     result = {
                         "heard": "",
@@ -295,7 +298,7 @@ async def phone_say_and_listen(
                         "truncated": False,
                         "call_ended": session.ended,
                         "during_agent_speech": False,
-                        "still_speaking": True,
+                        "still_speaking": session.speaking_until > session.clock(),
                     }
                 else:
                     result = await session.listen(
@@ -375,9 +378,11 @@ async def phone_listen(call_id: str, timeout_seconds: int = 30, end_silence_ms: 
         session = _session_for_turn(call_id)
         if session.ended:
             return format_response(_ended_result(session))
+        # Count the timeout from the call, including any wait for the lock.
+        started = session.clock()
         with session.activity():
             async with session.lock:
-                result = await session.listen(float(timeout_seconds), end_silence_ms / 1000.0)
+                result = await session.listen(float(timeout_seconds), end_silence_ms / 1000.0, base=started)
                 result["barge_in"] = session.consume_barge_in()
                 result.update(session.status_fields())
     except PhoneError as exc:

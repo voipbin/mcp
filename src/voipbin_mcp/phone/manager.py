@@ -13,6 +13,11 @@ the scope stays cancelled. So:
 - every cleanup path (hangup, speaking stop, groupcall hangup, shutdown) runs
   inside ``anyio.move_on_after(5, shield=True)`` and only logs failures;
 - asyncio.shield is never used.
+
+The shield sits at the cleanup entry point (``_cleanup_outgoing``,
+``_reject_if_ringing``, ``shutdown``, the configure rollback); the helpers they
+call (``_hangup_groupcall_now``, ``_reject_now``, ``PhoneSession._hangup_now``)
+are unshielded, so every shield is the only guard of its path.
 """
 
 from __future__ import annotations
@@ -326,14 +331,18 @@ class SessionManager:
         self._mark_handled(entry.event.id)
         await self._reject_if_ringing(entry.event.id)
 
+    async def _reject_now(self, call_id: str) -> None:
+        """Hang up a call still ringing (unshielded; callers provide the shield)."""
+        try:
+            call = await self.client.get(f"/calls/{call_id}")
+            if call.get("status") == "ringing":
+                await api_post(self.client, f"/calls/{call_id}/hangup")
+        except Exception as exc:
+            logger.info("rejecting unclaimed call %s: %s", call_id, exc)
+
     async def _reject_if_ringing(self, call_id: str) -> None:
         with anyio.move_on_after(5, shield=True):
-            try:
-                call = await self.client.get(f"/calls/{call_id}")
-                if call.get("status") == "ringing":
-                    await api_post(self.client, f"/calls/{call_id}/hangup")
-            except Exception as exc:
-                logger.info("rejecting unclaimed call %s: %s", call_id, exc)
+            await self._reject_now(call_id)
 
     def _on_reconnect(self) -> None:
         for session in list(self.sessions.values()):
@@ -394,7 +403,9 @@ class SessionManager:
         max_duration_seconds: int,
         answer_timeout_seconds: int,
     ) -> dict:
+        self._refuse_if_closing()
         await self.ensure_started()
+        self._refuse_if_closing()
         self.reserve_slot()
         session = self.new_session(
             direction="outgoing",
@@ -452,6 +463,8 @@ class SessionManager:
             reason = exc.reason if isinstance(exc, PhoneError) else "setup_failed"
             await self._cleanup_outgoing(session, candidates, reason)
             raise
+        # The idle watchdog counts from the answer, not from the dial.
+        session.touch()
         return {
             "call_id": session.call_id,
             "status": "answered",
@@ -565,55 +578,58 @@ class SessionManager:
     async def _cleanup_outgoing(self, session: PhoneSession, candidates: list[str], reason: str) -> None:
         with anyio.move_on_after(5, shield=True):
             if session.call_id:
-                await session.hangup(reason)
+                await session._hangup_now(reason)
             else:
                 session.mark_ended(reason)
                 if session.groupcall_id:
-                    await self._hangup_groupcall(session.groupcall_id, candidates)
+                    await self._hangup_groupcall_now(session.groupcall_id, candidates)
         self.pending.discard(session)
 
-    async def _hangup_groupcall(self, groupcall_id: str, known: list[str]) -> None:
-        """Hang up a groupcall and every leg it created (legs start async)."""
-        with anyio.move_on_after(5, shield=True):
+    async def _hangup_groupcall_now(self, groupcall_id: str, known: list[str]) -> None:
+        """Hang up a groupcall and every leg it created (legs start async).
+
+        Unshielded and unbounded by itself: callers run it inside
+        ``anyio.move_on_after(5, shield=True)``.
+        """
+        try:
+            await api_post(self.client, f"/groupcalls/{groupcall_id}/hangup")
+        except Exception as exc:
+            logger.info("groupcall %s hangup: %s", groupcall_id, exc)
+        legs: list[str] = list(known)
+        while True:
+            group: dict | None = None
             try:
-                await api_post(self.client, f"/groupcalls/{groupcall_id}/hangup")
-            except Exception as exc:
-                logger.info("groupcall %s hangup: %s", groupcall_id, exc)
-            legs: list[str] = list(known)
-            while True:
-                group: dict | None = None
+                group = await self.client.get(f"/groupcalls/{groupcall_id}")
+            except VoIPbinAPIError as exc:
+                if is_not_found(exc):
+                    group = None
+                    if not legs:
+                        break
+            except Exception as exc:  # pragma: no cover
+                logger.info("groupcall %s lookup: %s", groupcall_id, exc)
+            for c in (group or {}).get("call_ids") or []:
+                if str(c) not in legs:
+                    legs.append(str(c))
+            live = 0
+            for c in legs:
                 try:
-                    group = await self.client.get(f"/groupcalls/{groupcall_id}")
+                    call = await self.client.get(f"/calls/{c}")
                 except VoIPbinAPIError as exc:
-                    if is_not_found(exc):
-                        group = None
-                        if not legs:
-                            break
-                except Exception as exc:  # pragma: no cover
-                    logger.info("groupcall %s lookup: %s", groupcall_id, exc)
-                for c in (group or {}).get("call_ids") or []:
-                    if str(c) not in legs:
-                        legs.append(str(c))
-                live = 0
-                for c in legs:
+                    if not is_not_found(exc):
+                        live += 1
+                    continue
+                except Exception:  # pragma: no cover
+                    live += 1
+                    continue
+                if call.get("status") != "hangup":
+                    live += 1
                     try:
-                        call = await self.client.get(f"/calls/{c}")
-                    except VoIPbinAPIError as exc:
-                        if not is_not_found(exc):
-                            live += 1
-                        continue
-                    except Exception:  # pragma: no cover
-                        live += 1
-                        continue
-                    if call.get("status") != "hangup":
-                        live += 1
-                        try:
-                            await api_post(self.client, f"/calls/{c}/hangup")
-                        except Exception as exc:
-                            logger.info("leg %s hangup: %s", c, exc)
-                if legs and live == 0:
-                    break
-                await anyio.sleep(self.config.groupcall_cleanup_interval)
+                        await api_post(self.client, f"/calls/{c}/hangup")
+                    except Exception as exc:
+                        logger.info("leg %s hangup: %s", c, exc)
+            if legs and live == 0:
+                break
+            await anyio.sleep(self.config.groupcall_cleanup_interval)
 
     # ------------------------------------------------------------- incoming
 
@@ -725,8 +741,14 @@ class SessionManager:
             "enabled": False,
         }
 
+    def _refuse_if_closing(self) -> None:
+        if self._closing:
+            raise PhoneError("the MCP server is shutting down", "shutting_down")
+
     async def _next_incoming(self, waiter: IncomingWaiter, deadline: float) -> CallEvent | None:
         while True:
+            # Shutdown hangs up what exists; it must not race a new answer.
+            self._refuse_if_closing()
             # 1. a ringing call still inside the rejection grace period
             for call_id, entry in list(self.unclaimed.items()):
                 if entry.event.flow_id == waiter.flow_id:
@@ -734,16 +756,22 @@ class SessionManager:
                     if entry.task is not None:
                         entry.task.cancel()
                     return entry.event
-            # 2. a call that arrived just before this waiter started
+            # 2. a call that arrived just before this waiter started. It is
+            # removed only after the check, so a cancellation during the GET
+            # leaves it for the unclaimed handover in wait_incoming's finally.
             while waiter.buffered:
-                event = waiter.buffered.pop(0)
+                event = waiter.buffered[0]
                 if event.id in self._handled or event.id in self.sessions:
+                    waiter.buffered.pop(0)
                     continue
                 try:
                     call = await self.client.get(f"/calls/{event.id}")
                 except VoIPbinAPIError:
+                    waiter.buffered.pop(0)
                     continue
+                waiter.buffered.pop(0)
                 if call.get("status") == "ringing":
+                    self._refuse_if_closing()
                     return event
                 self._mark_handled(event.id)
             # 3. live events
@@ -767,6 +795,7 @@ class SessionManager:
         voice_id: str,
         max_duration_seconds: int,
     ) -> dict:
+        self._refuse_if_closing()
         await self.ensure_started()
         number = await self.client.get(f"/numbers/{number_id}")
         flow_id = str(number.get("call_flow_id") or "")
@@ -778,6 +807,7 @@ class SessionManager:
             )
         if number_id in self.waiters:
             raise PhoneError("this process is already waiting for calls on the number", "waiter_exists")
+        self._refuse_if_closing()
         self.reserve_slot()
         slot_owned = True
         waiter = IncomingWaiter(number_id, flow_id)
@@ -823,6 +853,8 @@ class SessionManager:
                 except BaseException:
                     await session.hangup("setup_failed")
                     raise
+                # The idle watchdog counts from the answer, not from the wait.
+                session.touch()
                 return {
                     "call_id": session.call_id,
                     "status": "answered",
@@ -833,8 +865,19 @@ class SessionManager:
         finally:
             if self.waiters.get(number_id) is waiter:
                 del self.waiters[number_id]
-            for event in list(waiter.candidates):
-                if event.id not in self._handled and event.id not in self.sessions:
+            # Ringing calls this waiter saw but did not take (live candidates,
+            # and pre-wait buffered ones left by a cancellation or by taking
+            # another call first) fall back to the unclaimed rejection path.
+            leftovers = list(waiter.buffered) + list(waiter.candidates)
+            waiter.buffered.clear()
+            waiter.candidates.clear()
+            for event in leftovers:
+                if (
+                    event.id not in self._handled
+                    and event.id not in self.sessions
+                    and event.id not in self.unclaimed
+                    and not self._closing
+                ):
                     self._start_unclaimed(event)
             if slot_owned:
                 self.release_slot()
@@ -866,9 +909,11 @@ class SessionManager:
 
     async def shutdown(self) -> None:
         """Hang up everything this process owns (5 second budget, shielded)."""
+        # Set first: no new call may start or be answered from here on.
+        self._closing = True
+        self.changed.notify()
         if not self.has_state():
             return
-        self._closing = True
         with anyio.move_on_after(5, shield=True):
             while self.inflight_posts > 0:
                 await self.changed.wait(0.1)
@@ -880,15 +925,15 @@ class SessionManager:
             async with anyio.create_task_group() as tg:
                 for session in list(self.sessions.values()):
                     if not session.ended:
-                        tg.start_soon(session.hangup, "shutdown")
+                        tg.start_soon(session._hangup_now, "shutdown")
                 for session in list(self.pending):
                     if not session.call_id and session.groupcall_id and not session.ended:
                         session.mark_ended("shutdown")
                         tg.start_soon(
-                            self._hangup_groupcall, session.groupcall_id, list(session.candidate_call_ids)
+                            self._hangup_groupcall_now, session.groupcall_id, list(session.candidate_call_ids)
                         )
                 for call_id, _entry in unclaimed:
-                    tg.start_soon(self._reject_if_ringing, call_id)
+                    tg.start_soon(self._reject_now, call_id)
         for task in (self._hub_task, self._supervisor_task):
             if task is not None and not task.done():
                 task.cancel()

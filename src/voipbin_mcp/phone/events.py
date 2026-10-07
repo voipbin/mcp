@@ -21,7 +21,7 @@ import dataclasses
 import json
 import logging
 from typing import Any, Callable
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from websockets.asyncio.client import connect as ws_connect
 
@@ -129,7 +129,7 @@ def build_ws_url(base_url: str, api_key: str, auth_transport: str) -> tuple[str,
     query = ""
     headers: dict[str, str] = {}
     if auth_transport == "query":
-        query = f"accesskey={api_key}"
+        query = urlencode({"accesskey": api_key})
     else:
         headers["Cookie"] = f"accesskey={api_key}"
     return urlunsplit((scheme, parts.netloc, path, query, "")), headers

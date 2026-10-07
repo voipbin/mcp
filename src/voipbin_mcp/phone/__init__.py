@@ -47,6 +47,9 @@ class PhoneConfig:
     listen_grace_seconds: float = 5.0
     interim_active_seconds: float = 2.0
     say_and_listen_max_block: float = 130.0
+    # A listen that times out reconciles missed transcripts within this
+    # budget; phone_say_and_listen reserves it inside its 130 s cap.
+    reconcile_timeout: float = 3.0
     say_wait_max: float = 120.0
     # Call setup (sections 4.3, 4.4).
     poll_interval: float = 1.0

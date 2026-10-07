@@ -21,6 +21,8 @@ from phone_fakes import (
     ok,
     settle,
     teardown_manager,
+    yielding,
+    yielding_ok,
 )
 from voipbin_mcp.phone import NIL_UUID, PhoneError
 from voipbin_mcp.phone.manager import current_manager, reset_manager, shutdown_if_started
@@ -327,7 +329,7 @@ class TestOutgoingCancellation:
             return ok({"calls": [{"id": "c1"}]})
 
         api.post("/calls").mock(side_effect=slow_post)
-        hang = api.post("/calls/c1/hangup").mock(return_value=ok({}))
+        hang = api.post("/calls/c1/hangup").mock(side_effect=yielding_ok())
         async with anyio.create_task_group() as tg:
             tg.start_soon(phone_tools.phone_call_start, "+1555", "tel", "+1666")
             await entered.wait()
@@ -340,7 +342,7 @@ class TestOutgoingCancellation:
     async def test_cancel_right_after_post_hangs_up(self, api, manager):
         post = api.post("/calls").mock(return_value=ok({"calls": [{"id": "c1"}]}))
         api.get("/calls/c1").mock(return_value=ok({"status": "dialing"}))
-        hang = api.post("/calls/c1/hangup").mock(return_value=ok({}))
+        hang = api.post("/calls/c1/hangup").mock(side_effect=yielding_ok())
         async with anyio.create_task_group() as tg:
             tg.start_soon(phone_tools.phone_call_start, "+1555", "tel", "+1666")
             await wait_until(lambda: post.called)
@@ -352,15 +354,15 @@ class TestOutgoingCancellation:
         api.get("/groupcalls/g1").mock(return_value=ok({"status": "progressing", "call_ids": ["l1", "l2"]}))
         # l1 keeps ringing until it has been hung up; l2 was never created.
         l1_state = {"status": "ringing"}
-        api.get("/calls/l1").mock(side_effect=lambda r: ok(dict(l1_state)))
-        api.get("/calls/l2").mock(return_value=err(404))
-        ghang = api.post("/groupcalls/g1/hangup").mock(return_value=ok({}))
+        api.get("/calls/l1").mock(side_effect=yielding(lambda r: ok(dict(l1_state))))
+        api.get("/calls/l2").mock(side_effect=yielding(err(404)))
+        ghang = api.post("/groupcalls/g1/hangup").mock(side_effect=yielding_ok())
 
         def hang_l1(request):
             l1_state["status"] = "hangup"
             return ok({})
 
-        lhang = api.post("/calls/l1/hangup").mock(side_effect=hang_l1)
+        lhang = api.post("/calls/l1/hangup").mock(side_effect=yielding(hang_l1))
         async with anyio.create_task_group() as tg:
             tg.start_soon(phone_tools.phone_call_start, "+1555", "extension", "e1")
             await wait_until(lambda: manager.pending)
@@ -381,12 +383,28 @@ class TestOutgoingCancellation:
             return ok({"id": "tr1"})
 
         api.post("/transcribes").mock(side_effect=slow_transcribe)
-        hang = api.post("/calls/c1/hangup").mock(return_value=ok({}))
+        hang = api.post("/calls/c1/hangup").mock(side_effect=yielding_ok())
         emit_later(manager, 0.01, call_event("c1", "progressing"))
         async with anyio.create_task_group() as tg:
             tg.start_soon(phone_tools.phone_call_start, "+1555", "tel", "+1666")
             await started.wait()
             tg.cancel_scope.cancel()
+        assert hang.call_count == 1
+
+    async def test_cancel_during_speaking_creation_stops_the_new_speaking(self, api, manager):
+        api.post("/calls").mock(return_value=ok({"calls": [{"id": "c1"}]}))
+        entered = asyncio.Event()
+        api.post("/speakings").mock(side_effect=yielding_ok({"id": "sp1"}, entered=entered))
+        stop = api.post("/speakings/sp1/stop").mock(side_effect=yielding_ok())
+        hang = api.post("/calls/c1/hangup").mock(side_effect=yielding_ok())
+        # start_media's reconcile is where the cancellation lands.
+        api.get("/calls/c1").mock(side_effect=yielding_ok({"status": "progressing"}, delay=0.1))
+        emit_later(manager, 0.01, call_event("c1", "progressing"))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(phone_tools.phone_call_start, "+1555", "tel", "+1666")
+            await entered.wait()
+            tg.cancel_scope.cancel()
+        assert stop.call_count == 1  # not orphaned: speakings outlive a hangup
         assert hang.call_count == 1
 
 
@@ -458,7 +476,7 @@ class TestSupervisor:
             s = answered_session(m)
             clock.advance(299)
             m.supervise_once()
-            assert not s.ended
+            assert not s.hangup_requested
             clock.advance(2)
             m.supervise_once()
             m.supervise_once()  # must not double-spawn
@@ -471,11 +489,22 @@ class TestSupervisor:
     async def test_a_blocking_listen_counts_as_activity(self, api):
         m, clock = await self._manager(idle_hangup_seconds=300)
         try:
+            api.post("/speakings/sp1/stop").mock(return_value=ok({}))
+            api.post("/calls/c1/hangup").mock(return_value=ok({}))
             s = answered_session(m)
             s.active_ops = 1
             clock.advance(1000)
             m.supervise_once()
-            assert not s.ended
+            assert not s.hangup_requested
+            # Once the blocking tool returns, idleness counts from that pass.
+            s.active_ops = 0
+            clock.advance(299)
+            m.supervise_once()
+            assert not s.hangup_requested
+            clock.advance(2)
+            m.supervise_once()
+            assert s.hangup_requested
+            await settle(m)
         finally:
             await teardown_manager(m)
 
@@ -488,7 +517,7 @@ class TestSupervisor:
             clock.advance(30)
             s.touch()
             m.supervise_once()
-            assert not s.ended
+            assert not s.hangup_requested
             clock.advance(31)
             s.touch()
             m.supervise_once()
@@ -595,8 +624,10 @@ class TestIncoming:
         assert result["call_id"] == "x1" and result["status"] == "answered"
         assert result["caller"] == {"type": "tel", "target": "+15559999"}
         assert body(talk.calls[0]) == {"text": "Hi there.", "language": "ko-KR"}
-        # media is created only after the answer
-        assert tr.calls[0].request is not None
+        # media is created only after the answer (/talk answers the call)
+        assert tr.call_count == 1
+        order = [c.request.url.path for c in api.calls]
+        assert order.index("/v1.0/calls/x1/talk") < order.index("/v1.0/transcribes")
         assert manager.waiters == {}
         assert manager.slots_in_use == 1
 
@@ -893,8 +924,8 @@ class TestShutdown:
         assert api.calls.call_count == 0
 
     async def test_main_finally_hangs_up_live_sessions(self, api, manager, monkeypatch):
-        api.post("/speakings/sp1/stop").mock(return_value=ok({}))
-        hang = api.post("/calls/c1/hangup").mock(return_value=ok({}))
+        api.post("/speakings/sp1/stop").mock(side_effect=yielding_ok())
+        hang = api.post("/calls/c1/hangup").mock(side_effect=yielding_ok())
         answered_session(manager)
 
         async def serve():
@@ -913,14 +944,14 @@ class TestShutdown:
 
         api.post("/calls").mock(side_effect=slow_post)
         api.get("/calls/c1").mock(return_value=ok({"status": "dialing"}))
-        hang = api.post("/calls/c1/hangup").mock(return_value=ok({}))
+        hang = api.post("/calls/c1/hangup").mock(side_effect=yielding_ok())
         # an unclaimed ringing call on a flow this process waited on
         manager.incoming_flow_ids.add("mf1")
         manager.config.unclaimed_incoming_grace_seconds = 60
-        api.get("/calls/u1").mock(return_value=ok({"status": "ringing"}))
-        uhang = api.post("/calls/u1/hangup").mock(return_value=ok({}))
-        api.get("/calls/u2").mock(return_value=ok({"status": "progressing"}))
-        u2hang = api.post("/calls/u2/hangup").mock(return_value=ok({}))
+        api.get("/calls/u1").mock(side_effect=yielding_ok({"status": "ringing"}))
+        uhang = api.post("/calls/u1/hangup").mock(side_effect=yielding_ok())
+        api.get("/calls/u2").mock(side_effect=yielding_ok({"status": "progressing"}))
+        u2hang = api.post("/calls/u2/hangup").mock(side_effect=yielding_ok())
 
         starting = asyncio.create_task(phone_tools.phone_call_start("+1", "tel", "+2"))
         await wait_until(lambda: manager.inflight_posts == 1)
@@ -942,8 +973,8 @@ class TestShutdown:
         exits = []
         m = make_manager(exits=exits)
         try:
-            api.post("/speakings/sp1/stop").mock(return_value=ok({}))
-            hang = api.post("/calls/c1/hangup").mock(return_value=ok({}))
+            api.post("/speakings/sp1/stop").mock(side_effect=yielding_ok())
+            hang = api.post("/calls/c1/hangup").mock(side_effect=yielding_ok())
             answered_session(m)
             m._on_signal(signal.SIGTERM)
             task = m._signal_task
@@ -982,3 +1013,207 @@ class TestShutdown:
         assert hang.call_count == 1
         again = json.loads(await phone_tools.phone_hangup("c1"))
         assert again["status"] == "ended" and hang.call_count == 1
+
+
+# ------------------------------------------------- shields under cancellation
+
+
+class TestCleanupShields:
+    """Each cleanup entry point, entered from a cancelled anyio scope.
+
+    The mocks yield to the loop (``yielding``), so an unshielded request is
+    really cancelled and does not reach respx's call record.
+    """
+
+    async def test_shutdown_from_a_cancelled_scope_still_hangs_up(self, api, manager):
+        stop = api.post("/speakings/sp1/stop").mock(side_effect=yielding_ok())
+        hang = api.post("/calls/c1/hangup").mock(side_effect=yielding_ok())
+        api.post("/calls").mock(return_value=ok({"groupcalls": [{"id": "g1", "call_ids": ["l1"]}]}))
+        ghang = api.post("/groupcalls/g1/hangup").mock(side_effect=yielding_ok())
+        api.get("/groupcalls/g1").mock(side_effect=yielding(err(404)))
+        api.get("/calls/l1").mock(side_effect=yielding_ok({"status": "hangup"}))
+        manager.incoming_flow_ids.add("mf1")
+        manager.config.unclaimed_incoming_grace_seconds = 60
+        api.get("/calls/u1").mock(side_effect=yielding_ok({"status": "ringing"}))
+        uhang = api.post("/calls/u1/hangup").mock(side_effect=yielding_ok())
+        answered_session(manager)
+        pending = manager.new_session(direction="outgoing")
+        pending.groupcall_id = "g1"
+        pending.candidate_call_ids = ["l1"]
+        manager.pending.add(pending)
+        manager.on_event(ringing("u1"))
+
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await manager.shutdown()
+        assert stop.call_count == 1 and hang.call_count == 1
+        assert ghang.call_count == 1
+        assert uhang.call_count == 1
+
+    async def test_reject_if_ringing_from_a_cancelled_scope_still_rejects(self, api, manager):
+        get = api.get("/calls/u1").mock(side_effect=yielding_ok({"status": "ringing"}))
+        hang = api.post("/calls/u1/hangup").mock(side_effect=yielding_ok())
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await manager._reject_if_ringing("u1")
+        assert get.call_count == 1 and hang.call_count == 1
+
+    async def test_cleanup_outgoing_from_a_cancelled_scope_hangs_up_every_leg(self, api, manager):
+        ghang = api.post("/groupcalls/g1/hangup").mock(side_effect=yielding_ok())
+        api.get("/groupcalls/g1").mock(side_effect=yielding_ok({"call_ids": ["l1"]}))
+        state = {"status": "ringing"}
+        api.get("/calls/l1").mock(side_effect=yielding(lambda r: ok(dict(state))))
+
+        def hang_l1(request):
+            state["status"] = "hangup"
+            return ok({})
+
+        lhang = api.post("/calls/l1/hangup").mock(side_effect=yielding(hang_l1))
+        session = manager.new_session(direction="outgoing")
+        session.groupcall_id = "g1"
+        manager.pending.add(session)
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await manager._cleanup_outgoing(session, ["l1"], "setup_failed")
+        assert ghang.call_count == 1 and lhang.call_count == 1
+        assert session.ended and not manager.pending
+
+    async def test_configure_cancelled_during_the_put_deletes_the_new_flow(self, api, manager):
+        api.get("/numbers/n1").mock(return_value=ok({"call_flow_id": NIL_UUID}))
+        api.post("/flows").mock(return_value=ok({"id": "mf1"}))
+        entered = asyncio.Event()
+        api.put("/numbers/n1/flow_ids").mock(side_effect=yielding_ok(delay=1.0, entered=entered))
+        delete = api.delete("/flows/mf1").mock(side_effect=yielding_ok())
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(phone_tools.phone_incoming_configure, "n1", True)
+            await entered.wait()
+            tg.cancel_scope.cancel()
+        assert delete.call_count == 1
+
+
+# ---------------------------------------------------- routing and lifecycle
+
+
+class TestRoutingAndLifecycle:
+    async def test_a_call_for_another_configured_number_is_not_taken(self, api, manager):
+        mock_number(api)
+        manager.incoming_flow_ids.add("mf2")  # a second number this process waited on
+        manager.config.unclaimed_incoming_grace_seconds = 60
+        emit_later(manager, 0.02, ringing("b1", flow_id="mf2"))
+        result = await manager.wait_incoming(**await wait_args(timeout_seconds=0.2))
+        assert result["timed_out"] is True
+        assert "b1" in manager.unclaimed  # left for its own waiter or rejection
+        assert "b1" not in manager.sessions
+
+    async def test_an_unrelated_progressing_call_does_not_answer_a_groupcall(self, api, manager):
+        api.post("/calls").mock(return_value=ok({"groupcalls": [{"id": "g1", "call_ids": ["l1"]}]}))
+        api.get("/groupcalls/g1").mock(return_value=ok({"status": "progressing", "call_ids": ["l1"]}))
+        api.get("/calls/l1").mock(return_value=ok({"status": "ringing"}))
+        emit_later(manager, 0.01, call_event("z9", "progressing"))  # someone else's call
+        emit_later(manager, 0.03, call_event("l1", "progressing", groupcall_id="g1"))
+        result = await manager.call_start(
+            source_number="+1", destination_type="extension", destination_target="e",
+            language="en-US", voice_id="", max_duration_seconds=60, answer_timeout_seconds=5,
+        )
+        assert result["call_id"] == "l1"
+        assert "z9" not in manager.sessions
+
+    async def test_no_call_starts_once_shutdown_began(self, api, manager):
+        post = api.post("/calls").mock(return_value=ok({"calls": [{"id": "c1"}]}))
+        mock_number(api)
+        await manager.shutdown()
+        result = json.loads(await phone_tools.phone_call_start("+1555", "tel", "+1666"))
+        assert result["reason"] == "shutting_down"
+        result = json.loads(await phone_tools.phone_wait_incoming("n1", timeout_seconds=1))
+        assert result["reason"] == "shutting_down"
+        assert post.call_count == 0
+        assert manager.slots_in_use == 0
+
+    async def test_a_waiter_stops_and_answers_nothing_once_shutdown_began(self, api, manager):
+        mock_number(api)
+        talk = api.post("/calls/x1/talk").mock(return_value=httpx.Response(200))
+        api.get("/calls/x1").mock(return_value=ok({"status": "ringing"}))
+        waiting = asyncio.create_task(phone_tools.phone_wait_incoming("n1", timeout_seconds=5))
+        await wait_until(lambda: manager.waiters)
+        await manager.shutdown()
+        manager.on_event(ringing("x1"))
+        result = json.loads(await asyncio.wait_for(waiting, 1))
+        assert result["reason"] == "shutting_down"
+        assert talk.call_count == 0
+        assert manager.slots_in_use == 0 and manager.waiters == {}
+
+    async def test_buffered_call_survives_a_cancel_during_its_check(self, api, manager):
+        mock_number(api)
+        await manager.ensure_started()
+        manager.config.unclaimed_incoming_grace_seconds = 60
+        manager.on_event(ringing("x1"))  # before any wait: buffered only
+        entered = asyncio.Event()
+        api.get("/calls/x1").mock(side_effect=yielding_ok({"status": "ringing"}, delay=1.0, entered=entered))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(phone_tools.phone_wait_incoming, "n1")
+            await entered.wait()
+            tg.cancel_scope.cancel()
+        assert "x1" in manager.unclaimed  # handed to the rejection path, not lost
+
+    async def test_buffered_call_left_behind_by_taking_another_is_not_lost(self, api, manager):
+        mock_number(api)
+        await manager.ensure_started()
+        manager.config.unclaimed_incoming_grace_seconds = 60
+        manager.on_event(ringing("x1"))  # buffered only (flow not yet known)
+        manager._start_unclaimed(ringing("u1"))  # taken first by the waiter
+
+        def progress(request):
+            emit_later(manager, 0.01, call_event("u1", "progressing", direction="incoming"))
+            return httpx.Response(200)
+
+        api.post("/calls/u1/talk").mock(side_effect=progress)
+        result = await manager.wait_incoming(**await wait_args())
+        assert result["call_id"] == "u1"
+        assert "x1" in manager.unclaimed
+
+    async def test_idle_timer_starts_at_the_answer_of_an_outgoing_call(self, api):
+        clock = ManualClock()
+        m = make_manager(clock=clock, idle_hangup_seconds=300)
+        try:
+            api.post("/calls").mock(return_value=ok({"calls": [{"id": "c1"}]}))
+
+            def slow_answer(request):
+                clock.advance(250)  # dialing and media setup took a while
+                return ok({"id": "tr1"})
+
+            api.post("/transcribes").mock(side_effect=slow_answer)
+            emit_later(m, 0.01, call_event("c1", "progressing"))
+            await m.call_start(
+                source_number="+1", destination_type="tel", destination_target="+2",
+                language="en-US", voice_id="", max_duration_seconds=3600, answer_timeout_seconds=60,
+            )
+            s = m.sessions["c1"]
+            assert s.last_tool_at == clock.now
+            clock.advance(100)
+            m.supervise_once()
+            assert not s.hangup_requested
+        finally:
+            await teardown_manager(m)
+
+    async def test_idle_timer_starts_at_the_answer_of_an_incoming_call(self, api):
+        clock = ManualClock()
+        m = make_manager(clock=clock, idle_hangup_seconds=300)
+        try:
+            mock_number(api)
+
+            def progress(request):
+                clock.advance(250)  # waited a long time for the call
+                emit_later(m, 0.01, call_event("x1", "progressing", direction="incoming"))
+                return httpx.Response(200)
+
+            api.post("/calls/x1/talk").mock(side_effect=progress)
+            api.get("/calls/x1").mock(return_value=ok({"status": "ringing"}))
+            emit_later(m, 0.02, ringing("x1"))
+            await m.wait_incoming(**await wait_args())
+            s = m.sessions["x1"]
+            assert s.last_tool_at == clock.now
+            clock.advance(100)
+            m.supervise_once()
+            assert not s.hangup_requested
+        finally:
+            await teardown_manager(m)

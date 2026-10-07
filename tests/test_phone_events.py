@@ -123,6 +123,13 @@ class TestUrlAndTopics:
         assert url == "ws://localhost:8080/v1.0/ws?accesskey=k1"
         assert headers == {}
 
+    def test_query_transport_encodes_the_access_key(self):
+        url, _ = build_ws_url("https://api.voipbin.net/v1.0", "a b&c=d+/", "query")
+        assert url == "wss://api.voipbin.net/v1.0/ws?accesskey=a+b%26c%3Dd%2B%2F"
+        from urllib.parse import parse_qs, urlsplit
+
+        assert parse_qs(urlsplit(url).query) == {"accesskey": ["a b&c=d+/"]}
+
     def test_five_four_part_topics_and_no_three_part_prefix(self):
         topics = subscription_topics(CID)
         assert len(topics) == 5

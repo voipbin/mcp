@@ -8,6 +8,12 @@ synchronously from the EventHub receive loop: they never await HTTP. Anything
 that needs the network (stopping speech on barge-in or hangup) is spawned as a
 background task whose cleanup runs under ``anyio.move_on_after(5,
 shield=True)``.
+
+Shielding is applied once, at the entry points (``_stop_speaking``,
+``hangup`` and the speaking creation in ``_post_and_record``). The
+``_send_stop``/``_hangup_now`` internals are unshielded so that a caller that
+already holds its own shield (manager cleanup, shutdown) does not nest a
+second one, and so that every shield is the only guard of some path.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ import logging
 from typing import Callable
 
 import anyio
+import anyio.lowlevel
 
 from voipbin_mcp.client import VoIPbinAPIError
 from voipbin_mcp.phone import Notifier, PhoneConfig, PhoneError, wait_task_done
@@ -163,7 +170,7 @@ class PhoneSession:
             self.deadline = now + self.max_duration_seconds
             self.changed.notify()
 
-    def mark_ended(self, reason: str, hangup_by: str = "") -> None:
+    def mark_ended(self, reason: str, hangup_by: str = "", *, stop_speaking: bool = True) -> None:
         if self.ended:
             return
         self.state = "ended"
@@ -172,10 +179,12 @@ class PhoneSession:
         self.ended_at = self.clock()
         self.speaking_until = min(self.speaking_until, self.ended_at)
         self.changed.notify()
-        # The platform does not stop a speaking session on hangup, so do it.
-        ids = self._take_speaking_ids()
-        if ids:
-            self._spawn(self._stop_all(ids))
+        # The platform does not stop a speaking session on hangup, so do it
+        # (unless the caller is about to stop them itself, under its shield).
+        for speaking_id in self._take_speaking_ids() if stop_speaking else ():
+            if speaking_id not in self.stale_speaking_ids:
+                self.stale_speaking_ids.append(speaking_id)
+            self._spawn(self._stop_speaking(speaking_id))
         if self._on_end is not None:
             self._on_end(self)
 
@@ -248,27 +257,26 @@ class PhoneSession:
 
     # -------------------------------------------------------------- speaking
 
-    async def _stop_speaking(self, speaking_id: str) -> bool:
+    async def _send_stop(self, speaking_id: str) -> bool:
+        """Stop one speaking session (unshielded; callers provide the shield)."""
         stopped = False
-        with anyio.move_on_after(5, shield=True):
-            try:
-                await api_post(self.client, f"/speakings/{speaking_id}/stop")
-                stopped = True
-            except VoIPbinAPIError as exc:
-                stopped = exc.status_code == 404
-                logger.info("speaking stop %s failed: %s", speaking_id, exc)
-            except Exception as exc:  # pragma: no cover - transport failure
-                logger.info("speaking stop %s failed: %s", speaking_id, exc)
+        try:
+            await api_post(self.client, f"/speakings/{speaking_id}/stop")
+            stopped = True
+        except VoIPbinAPIError as exc:
+            stopped = exc.status_code == 404
+            logger.info("speaking stop %s failed: %s", speaking_id, exc)
+        except Exception as exc:  # pragma: no cover - transport failure
+            logger.info("speaking stop %s failed: %s", speaking_id, exc)
         if stopped and speaking_id in self.stale_speaking_ids:
             self.stale_speaking_ids.remove(speaking_id)
         return stopped
 
-    async def _stop_all(self, ids: list[str]) -> None:
+    async def _stop_speaking(self, speaking_id: str) -> bool:
+        stopped = False
         with anyio.move_on_after(5, shield=True):
-            for speaking_id in ids:
-                if speaking_id not in self.stale_speaking_ids:
-                    self.stale_speaking_ids.append(speaking_id)
-                await self._stop_speaking(speaking_id)
+            stopped = await self._send_stop(speaking_id)
+        return stopped
 
     async def _post_speaking(self) -> dict:
         body = {
@@ -281,9 +289,34 @@ class PhoneSession:
             body["voice_id"] = self.voice_id
         return await api_post(self.client, "/speakings", body)
 
+    async def _post_and_record(self, gen: int) -> None:
+        """Create a speaking session and record its id, never losing it.
+
+        A speaking session the server created must always end up either as
+        ``speaking_id`` or stopped: the platform does not stop it on hangup.
+        So the POST and the recording are shielded from cancellation, and an
+        id that arrives after the call ended or after a barge-in (generation
+        change) is stopped instead of being used.
+        """
+        # A cancellation that is already pending stops us here, before the
+        # request; once the request is out, it must complete.
+        await anyio.lowlevel.checkpoint()
+        with anyio.CancelScope(shield=True):
+            created = await self._post_speaking()
+            new_id = str(created.get("id") or "") or None
+            if new_id is None:
+                return
+            if self.ended or gen != self.barge_gen:
+                if new_id not in self.stale_speaking_ids:
+                    self.stale_speaking_ids.append(new_id)
+                with anyio.move_on_after(5):
+                    await self._send_stop(new_id)
+                return
+            self.speaking_id = new_id
+
     async def _create_speaking(self, gen: int) -> None:
         try:
-            created = await self._post_speaking()
+            await self._post_and_record(gen)
         except VoIPbinAPIError as exc:
             # Retry only when nothing new happened (same generation) and the
             # refusal is the "an earlier speaking is still active" one, after
@@ -294,8 +327,7 @@ class PhoneSession:
                 await self._stop_speaking(speaking_id)
             if gen != self.barge_gen:
                 return
-            created = await self._post_speaking()
-        self.speaking_id = created.get("id") or None
+            await self._post_and_record(gen)
 
     async def start_media(self) -> None:
         """Start STT (aws, inbound leg) and TTS (outbound leg) after answer."""
@@ -317,8 +349,9 @@ class PhoneSession:
             self._on_transcribe(self, self.transcribe_id)
         self.last_stt_event_at = self.clock()
 
-        speaking = await self._post_speaking()
-        self.speaking_id = speaking.get("id") or None
+        await self._post_and_record(self.barge_gen)
+        if self.ended:
+            raise PhoneError("the call ended while media was starting", "call_failed")
         if not self.speaking_id:
             raise PhoneError("the speaking response carried no id", "media_start_failed")
 
@@ -347,7 +380,15 @@ class PhoneSession:
             now = self.clock()
             if self.speaking_until <= now:
                 self.say_at = now
-            await api_post(self.client, f"/speakings/{self.speaking_id}/say", {"text": piece})
+            try:
+                await api_post(self.client, f"/speakings/{self.speaking_id}/say", {"text": piece})
+            except Exception:
+                if gen != self.barge_gen or self.ended:
+                    # The barge-in stop raced this piece: the session it was
+                    # sent to is being stopped, so the failure is expected.
+                    interrupted = True
+                    break
+                raise
             if gen != self.barge_gen:
                 # The callee spoke while this piece was in flight: no retry,
                 # no further pieces.
@@ -438,8 +479,18 @@ class PhoneSession:
                     if not reconciled:
                         # A full subscriber buffer drops events silently;
                         # fetch what may have been missed before giving up.
+                        # Bounded, so a tool never blocks past its cap.
                         reconciled = True
-                        await self.reconcile()
+                        with anyio.move_on_after(self.config.reconcile_timeout):
+                            await self.reconcile()
+                        recovered = self.drain()
+                        if recovered:
+                            # Missed speech is the turn: return it now rather
+                            # than waiting for an end of silence that already
+                            # passed (and never mark it truncated for that).
+                            heard.extend(recovered)
+                            truncated = interim_active  # still talking at the cap
+                            break
                         continue
                     timed_out = True
                     truncated = interim_active
@@ -513,22 +564,26 @@ class PhoneSession:
 
     # ----------------------------------------------------------------- hangup
 
-    async def hangup(self, reason: str = "agent_hangup") -> None:
-        """Stop speech and hang up; failures are logged, never raised."""
+    async def _hangup_now(self, reason: str = "agent_hangup") -> None:
+        """Stop speech and hang up (unshielded; callers provide the shield)."""
         ids = self._take_speaking_ids()
         call_id = self.call_id
-        self.mark_ended(reason)
+        self.mark_ended(reason, stop_speaking=False)
+        for speaking_id in ids:
+            if speaking_id not in self.stale_speaking_ids:
+                self.stale_speaking_ids.append(speaking_id)
+            await self._send_stop(speaking_id)
+        if call_id:
+            try:
+                await api_post(self.client, f"/calls/{call_id}/hangup")
+            except Exception as exc:
+                # 404 or already ended is fine.
+                logger.info("hangup of call %s: %s", call_id, exc)
+
+    async def hangup(self, reason: str = "agent_hangup") -> None:
+        """Stop speech and hang up; failures are logged, never raised."""
         with anyio.move_on_after(5, shield=True):
-            for speaking_id in ids:
-                if speaking_id not in self.stale_speaking_ids:
-                    self.stale_speaking_ids.append(speaking_id)
-                await self._stop_speaking(speaking_id)
-            if call_id:
-                try:
-                    await api_post(self.client, f"/calls/{call_id}/hangup")
-                except Exception as exc:
-                    # 404 or already ended is fine.
-                    logger.info("hangup of call %s: %s", call_id, exc)
+            await self._hangup_now(reason)
 
     def summary(self) -> dict:
         now = self.clock()

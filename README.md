@@ -210,9 +210,12 @@ key; that value is stored by the API and can appear in responses.
   setups), transcription silently falls back to a provider that stops after
   about 5 minutes. This cannot be detected through the API; phone results
   include `stt_silent_seconds` when nothing has been recognised for 4 minutes.
-- If the MCP server is killed (SIGKILL), its calls stay up until their
-  maximum duration. The longest incoming conversation is one hour minus the
-  time the call spent ringing.
+- If the MCP server is killed (SIGKILL), it cannot hang up its calls. An
+  outgoing call stays up until its `max_duration_seconds` (the `sleep` placed
+  on the call ends). An incoming call stays up until the incoming flow's one
+  hour `sleep` ends or the platform's one hour channel timeout hangs it up,
+  whichever comes first, so the longest incoming conversation is one hour
+  minus the time the call spent ringing.
 - PSTN calling on the hosted platform follows the existing account policy.
 
 ## Getting an API Key

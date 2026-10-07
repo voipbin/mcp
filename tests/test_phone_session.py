@@ -23,6 +23,7 @@ from phone_fakes import (
     settle,
     teardown_manager,
     transcript,
+    yielding_ok,
 )
 from voipbin_mcp.phone import PhoneError
 
@@ -109,6 +110,44 @@ class TestListen:
         result = await s.listen(0.1, 0.05)
         assert result["heard"] == "lost words more"
         assert result["timed_out"] is False
+
+    async def test_reconcile_at_the_hard_cap_returns_recovered_speech_untruncated(self, api, manager):
+        api.get("/transcripts").mock(
+            return_value=ok({"result": [{"id": "t9", "message": "lost words", "direction": "in"}]})
+        )
+        s = answered_session(manager)
+        started = time.monotonic()
+        # soft == hard (the say_and_listen cap): the reconcile runs at the cap.
+        result = await s.listen(0.2, 2.0, hard_end=s.clock() + 0.2)
+        assert result["heard"] == "lost words"
+        assert result["timed_out"] is False
+        assert result["truncated"] is False
+        assert time.monotonic() - started < 1.0  # no extra end-of-silence wait
+
+    async def test_reconcile_while_the_callee_is_still_talking_marks_truncated(self, api, manager):
+        api.get("/transcripts").mock(
+            return_value=ok({"result": [{"id": "t9", "message": "lost words", "direction": "in"}]})
+        )
+        s = answered_session(manager)
+        for i in range(30):
+            later(0.02 + i * 0.03, manager.on_event, interim(f"still going {i}"))
+        result = await s.listen(0.1, 0.5)  # hard = 0.1 + grace 0.3
+        assert result["heard"] == "lost words"
+        assert result["timed_out"] is False
+        assert result["truncated"] is True
+
+    async def test_a_slow_reconcile_is_bounded(self, api):
+        m = make_manager(reconcile_timeout=0.1)
+        try:
+            transcripts = api.get("/transcripts").mock(side_effect=yielding_ok({"result": []}, delay=3.0))
+            s = answered_session(m)
+            started = time.monotonic()
+            result = await s.listen(0.1, 0.3)
+            assert time.monotonic() - started < 0.6
+            assert result["timed_out"] is True
+            assert transcripts.call_count == 0  # cut off, not answered
+        finally:
+            await teardown_manager(m)
 
     async def test_interim_at_timeout_extends_up_to_the_grace(self, api, manager):
         s = answered_session(manager)
@@ -323,6 +362,69 @@ class TestSayAndBargeIn:
         finally:
             await teardown_manager(m)
 
+    async def test_barge_in_while_the_say_post_is_in_flight(self, api, manager):
+        """The generation check after the POST: no estimate for a stopped piece."""
+        api.post("/speakings/sp1/say").mock(return_value=ok({}))
+        stop = api.post("/speakings/sp1/stop").mock(return_value=ok({}))
+        s = answered_session(manager)
+        await s.say("First sentence for the callee.")
+        await asyncio.sleep(0.08)  # inside the barge-in window of the first say
+
+        async def in_flight(request):
+            await asyncio.sleep(0.01)
+            manager.on_event(interim("hold on please"))  # callee talks now
+            await asyncio.sleep(0.01)
+            return ok({})
+
+        api.post("/speakings/sp1/say").mock(side_effect=in_flight)
+        result = await s.say("Second sentence.")
+        assert result["interrupted"] is True
+        assert result["sent_pieces"] == 0
+        assert result["estimated_seconds"] == 0.0
+        assert s.speaking_until <= s.clock()  # not extended for a stopped piece
+        await settle(manager)
+        assert stop.call_count == 1
+
+    async def test_say_error_caused_by_a_barge_in_stop_is_interrupted_not_raised(self, api, manager):
+        api.post("/speakings/sp1/say").mock(return_value=ok({}))
+        api.post("/speakings/sp1/stop").mock(return_value=ok({}))
+        s = answered_session(manager)
+        await s.say("First sentence for the callee.")
+        await asyncio.sleep(0.08)
+
+        async def stopped_under_us(request):
+            manager.on_event(interim("hold on please"))
+            await asyncio.sleep(0.01)
+            return err(404, "speaking not found")
+
+        api.post("/speakings/sp1/say").mock(side_effect=stopped_under_us)
+        result = await s.say("Second sentence.")
+        assert result["interrupted"] is True
+        await settle(manager)
+
+    async def test_say_error_without_a_barge_in_is_raised(self, api, manager):
+        from voipbin_mcp.client import VoIPbinAPIError
+
+        api.post("/speakings/sp1/say").mock(return_value=err(500, "tts down"))
+        s = answered_session(manager)
+        with pytest.raises(VoIPbinAPIError):
+            await s.say("Hello.")
+
+    async def test_speaking_created_after_the_call_ended_is_stopped(self, api, manager):
+        stop = api.post("/speakings/sp2/stop").mock(side_effect=yielding_ok())
+
+        async def create(request):
+            await asyncio.sleep(0.01)
+            manager.on_event(call_event("c1", "hangup", hangup_reason="normal"))
+            return ok({"id": "sp2"})
+
+        api.post("/speakings").mock(side_effect=create)
+        s = answered_session(manager, speaking_id=None)
+        result = await s.say("Hello.")
+        assert result["interrupted"] is True
+        assert stop.call_count == 1
+        assert s.speaking_id is None and s.stale_speaking_ids == []
+
     async def test_stale_speaking_is_stopped_again_before_the_one_create_retry(self, api, manager):
         api.post("/speakings/sp1/say").mock(return_value=ok({}))
         stop = api.post("/speakings/sp1/stop").mock(side_effect=[err(500), ok({})])
@@ -403,8 +505,8 @@ class TestHangup:
 class TestRepeatedCancellation:
     async def test_cleanup_http_is_sent_under_cancel_scope_cancel(self, api, manager):
         """anyio re-delivers cancellation at every await; cleanup must still run."""
-        stop = api.post("/speakings/sp1/stop").mock(return_value=ok({}))
-        hang = api.post("/calls/c1/hangup").mock(return_value=ok({}))
+        stop = api.post("/speakings/sp1/stop").mock(side_effect=yielding_ok())
+        hang = api.post("/calls/c1/hangup").mock(side_effect=yielding_ok())
         s = answered_session(manager)
 
         async def hang_up_in_cancelled_scope():
@@ -418,6 +520,56 @@ class TestRepeatedCancellation:
             tg.cancel_scope.cancel()
         assert stop.call_count == 1
         assert hang.call_count == 1
+
+    async def test_hangup_tool_cancelled_mid_cleanup_still_hangs_up(self, api, manager):
+        from voipbin_mcp.tools.phone import phone_hangup
+
+        entered = asyncio.Event()
+        stop = api.post("/speakings/sp1/stop").mock(side_effect=yielding_ok(entered=entered))
+        hang = api.post("/calls/c1/hangup").mock(side_effect=yielding_ok())
+        answered_session(manager)
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(phone_hangup, "c1")
+            await entered.wait()
+            tg.cancel_scope.cancel()
+        assert stop.call_count == 1
+        assert hang.call_count == 1
+
+    async def test_cancel_during_the_stale_stop_before_a_retry_still_stops(self, api, manager):
+        """_stop_speaking's own shield: the say retry path is cancellable."""
+        from voipbin_mcp.tools.phone import phone_say
+
+        entered = asyncio.Event()
+        create = api.post("/speakings").mock(return_value=err(500, "already active"))
+        stop = api.post("/speakings/sp1/stop").mock(side_effect=yielding_ok(entered=entered))
+        s = answered_session(manager, speaking_id=None)
+        s.stale_speaking_ids = ["sp1"]
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(phone_say, "c1", "Hello.")
+            await entered.wait()
+            tg.cancel_scope.cancel()
+        assert stop.call_count == 1
+        assert s.stale_speaking_ids == []
+        assert create.call_count == 1  # no retry after the cancellation
+
+    async def test_cancel_during_speaking_creation_still_records_the_id(self, api, manager):
+        """The created speaking must be owned (and so stopped on hangup)."""
+        from voipbin_mcp.tools.phone import phone_say
+
+        entered = asyncio.Event()
+        api.post("/speakings").mock(side_effect=yielding_ok({"id": "sp2"}, entered=entered))
+        say = api.post("/speakings/sp2/say").mock(side_effect=yielding_ok())
+        stop = api.post("/speakings/sp2/stop").mock(side_effect=yielding_ok())
+        hang = api.post("/calls/c1/hangup").mock(side_effect=yielding_ok())
+        s = answered_session(manager, speaking_id=None)
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(phone_say, "c1", "Hello.")
+            await entered.wait()
+            tg.cancel_scope.cancel()
+        assert s.speaking_id == "sp2"
+        assert say.call_count == 0
+        await s.hangup()
+        assert stop.call_count == 1 and hang.call_count == 1
 
     async def test_cancelled_listen_keeps_the_call_and_releases_the_lock(self, api, manager):
         from voipbin_mcp.tools.phone import phone_listen
@@ -492,6 +644,29 @@ class TestToolTurns:
                 took = time.monotonic() - started
                 assert result["timed_out"] is True
                 assert took >= 1.55  # 0.6 speech + 1.0 listen, not 1.0 alone
+        finally:
+            await teardown_manager(m)
+
+    async def test_say_and_listen_cap_includes_the_wait_for_the_lock(self, api):
+        from voipbin_mcp.tools.phone import phone_say_and_listen
+
+        m = make_manager(say_and_listen_max_block=1.0, reconcile_timeout=0.1, listen_grace_seconds=0.1)
+        try:
+            with respx.mock(base_url=BASE, assert_all_called=False) as mock:
+                mock.post("/speakings/sp1/say").mock(return_value=ok({}))
+                mock.get("/calls/c1").mock(return_value=ok({"status": "progressing"}))
+                mock.get("/transcripts").mock(return_value=ok({"result": []}))
+                s = answered_session(m)
+                await s.lock.acquire()
+                asyncio.get_running_loop().call_later(0.4, s.lock.release)
+                started = time.monotonic()
+                result = json.loads(await phone_say_and_listen("c1", "Hi.", 30, 300))
+                took = time.monotonic() - started
+                assert result["timed_out"] is True
+                # The 1.0 s cap counts from the call, not from the lock: 0.4 s
+                # lock wait, 0.2 s speech, listening up to 0.9 s (0.1 s is the
+                # reconcile reserve). Counting from the lock would give 1.3 s.
+                assert 0.8 <= took < 1.1, took
         finally:
             await teardown_manager(m)
 
