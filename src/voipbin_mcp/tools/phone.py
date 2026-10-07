@@ -63,8 +63,9 @@ def _ended_result(session) -> dict:
 
 
 def _session_for_turn(call_id: str):
+    # No touch here: every caller enters session.activity() right after,
+    # without an await in between, and that is what refreshes the idle timer.
     session = _manager().get_session(call_id)
-    session.touch()
     if not session.ended and session.state != "answered":
         raise PhoneError("the call is not answered yet", "not_answered")
     return session
@@ -340,12 +341,16 @@ async def phone_say(call_id: str, text: str, wait: bool = False, barge_in: bool 
         session = _session_for_turn(call_id)
         if session.ended:
             raise PhoneError("the call has ended", "call_ended", call_ended=True)
+        # The wait cap counts from the call, including the wait for the lock
+        # and the say requests themselves.
+        wait_until = session.clock() + session.config.say_wait_max
         with session.activity():
             async with session.lock:
                 spoken = await session.say(text, bool(barge_in))
                 result = {"queued": spoken["queued"], "estimated_seconds": spoken["estimated_seconds"]}
                 if wait:
-                    result["still_speaking"] = await session.wait_spoken(session.config.say_wait_max)
+                    remaining = max(0.0, wait_until - session.clock())
+                    result["still_speaking"] = await session.wait_spoken(remaining)
                 if session.consume_barge_in():
                     result["barge_in"] = True
                 result.update(session.status_fields())

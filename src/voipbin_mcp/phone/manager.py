@@ -125,6 +125,7 @@ class SessionManager:
         self._seq = 0
         self.changed = Notifier()
         self.slots_in_use = 0
+        self.slot_underflows = 0
         self.inflight_posts = 0
         self._tasks: set[asyncio.Task] = set()
 
@@ -161,6 +162,7 @@ class SessionManager:
             or self.unclaimed
             or self.waiters
             or self.inflight_posts
+            or any(not t.done() for t in self._tasks)
         )
 
     def _mark_handled(self, call_id: str) -> None:
@@ -179,7 +181,13 @@ class SessionManager:
         self.slots_in_use += 1
 
     def release_slot(self) -> None:
-        self.slots_in_use = max(0, self.slots_in_use - 1)
+        if self.slots_in_use <= 0:
+            # Every release pairs with one reserve; an extra one is a bug
+            # (counted so tests can assert it never happens).
+            self.slot_underflows += 1
+            logger.error("phone session slot released more often than reserved")
+            return
+        self.slots_in_use -= 1
 
     def new_session(self, *, direction: str, **kwargs) -> PhoneSession:
         session = PhoneSession(
@@ -310,6 +318,8 @@ class SessionManager:
             # Answered or abandoned elsewhere: never reject it.
             entry = self.unclaimed.pop(event.id, None)
             if entry is not None and entry.task is not None:
+                # Defensive: _reject_later already returns once its entry is
+                # gone from ``unclaimed``; this only frees the timer early.
                 entry.task.cancel()
             for waiter in self.waiters.values():
                 for candidate in list(waiter.candidates):
@@ -403,8 +413,10 @@ class SessionManager:
         max_duration_seconds: int,
         answer_timeout_seconds: int,
     ) -> dict:
+        # Before ensure_started: no /ws connection is opened once closing.
         self._refuse_if_closing()
         await self.ensure_started()
+        # Shutdown may have begun during GET /customer or the ready wait.
         self._refuse_if_closing()
         self.reserve_slot()
         session = self.new_session(
@@ -458,7 +470,11 @@ class SessionManager:
                 await self._await_single_answer(session, answer_timeout_seconds)
             else:
                 await self._resolve_groupcall(session, candidates, answer_timeout_seconds)
+                self._raise_if_ended(session)
             await session.start_media()
+            # A hangup that arrived while media was starting (e.g. found by
+            # its reconcile) must not be reported as answered.
+            self._raise_if_ended(session)
         except BaseException as exc:
             reason = exc.reason if isinstance(exc, PhoneError) else "setup_failed"
             await self._cleanup_outgoing(session, candidates, reason)
@@ -506,11 +522,23 @@ class SessionManager:
                 continue
             await session.changed.wait(min(end, next_poll) - now)
 
+    @staticmethod
+    def _raise_if_ended(session: PhoneSession) -> None:
+        if session.ended:
+            raise PhoneError(
+                "the call ended before it was answered",
+                "call_failed",
+                hangup_reason=session.ended_reason,
+            )
+
     def _confirm_leg(self, session: PhoneSession, call_id: str) -> None:
         session.call_id = call_id
         self.pending.discard(session)
         self.sessions[call_id] = session
         session.mark_answered()
+        # Events of this leg seen before it was routed to the session (a
+        # hangup right after the answer) apply now.
+        self._replay_buffer(session)
 
     async def _resolve_groupcall(self, session: PhoneSession, candidates: list[str], timeout: float) -> None:
         gid = session.groupcall_id
@@ -771,6 +799,7 @@ class SessionManager:
                     continue
                 waiter.buffered.pop(0)
                 if call.get("status") == "ringing":
+                    # Shutdown may have begun during the GET.
                     self._refuse_if_closing()
                     return event
                 self._mark_handled(event.id)
@@ -795,6 +824,7 @@ class SessionManager:
         voice_id: str,
         max_duration_seconds: int,
     ) -> dict:
+        # Before ensure_started: no /ws connection is opened once closing.
         self._refuse_if_closing()
         await self.ensure_started()
         number = await self.client.get(f"/numbers/{number_id}")
@@ -807,6 +837,8 @@ class SessionManager:
             )
         if number_id in self.waiters:
             raise PhoneError("this process is already waiting for calls on the number", "waiter_exists")
+        # Defensive: _next_incoming refuses too, but this avoids registering
+        # a waiter (and its flow id) when shutdown began during the GETs.
         self._refuse_if_closing()
         self.reserve_slot()
         slot_owned = True
@@ -845,8 +877,15 @@ class SessionManager:
                 try:
                     await self._answer_incoming(session, greeting, greeting_language)
                 except _CallerGone:
-                    # The caller hung up before we answered: keep waiting.
-                    session.slot_held = False
+                    # The caller hung up before we answered: keep waiting, on
+                    # the waiter's own slot again.
+                    if session.slot_held:
+                        session.slot_held = False
+                    else:
+                        # The hangup event already ended the session (and
+                        # released its slot) while /talk was in flight, so
+                        # take a new one; session_limit ends the wait.
+                        self.reserve_slot()
                     slot_owned = True
                     session.mark_ended("caller_hangup")
                     continue
@@ -876,6 +915,8 @@ class SessionManager:
                     event.id not in self._handled
                     and event.id not in self.sessions
                     and event.id not in self.unclaimed
+                    # shutdown already took the unclaimed list; a timer
+                    # started now would outlive it.
                     and not self._closing
                 ):
                     self._start_unclaimed(event)
@@ -904,8 +945,34 @@ class SessionManager:
         await self._await_single_answer(session, self.config.incoming_progress_timeout)
         # STT and TTS only work when created after the answer.
         await session.start_media()
+        self._raise_if_ended(session)
 
     # ------------------------------------------------------------- shutdown
+
+    def _all_sessions(self) -> list[PhoneSession]:
+        seen: dict[int, PhoneSession] = {}
+        for session in list(self.sessions.values()) + list(self.pending):
+            seen[id(session)] = session
+        return list(seen.values())
+
+    def _background_tasks(self) -> set[asyncio.Task]:
+        skip = {self._hub_task, self._supervisor_task, self._signal_task, asyncio.current_task()}
+        tasks = {t for t in self._tasks if t not in skip}
+        for session in self._all_sessions():
+            tasks |= set(session._tasks)
+            if session.pending_stop is not None:
+                tasks.add(session.pending_stop)
+        return {t for t in tasks if not t.done()}
+
+    async def _drain_background(self) -> None:
+        """Wait (never cancel) until background cleanup tasks are done."""
+        while True:
+            pending = self._background_tasks()
+            if not pending:
+                return
+            # Tasks may spawn more (a hangup spawns its speaking stops), so
+            # wait for one batch at a time; the caller's scope bounds it.
+            await asyncio.wait(pending)
 
     async def shutdown(self) -> None:
         """Hang up everything this process owns (5 second budget, shielded)."""
@@ -934,6 +1001,16 @@ class SessionManager:
                         )
                 for call_id, _entry in unclaimed:
                     tg.start_soon(self._reject_now, call_id)
+            # Within the same budget: let cleanup already running in the
+            # background finish (speaking stops after a hangup or barge-in,
+            # rejections past their grace, watchdog hangups), since the
+            # process exits right after this returns.
+            await self._drain_background()
+            # Then retry every speaking stop that is still unconfirmed.
+            async with anyio.create_task_group() as tg:
+                for session in self._all_sessions():
+                    for speaking_id in list(session.stale_speaking_ids):
+                        tg.start_soon(session._send_stop, speaking_id)
         for task in (self._hub_task, self._supervisor_task):
             if task is not None and not task.done():
                 task.cancel()

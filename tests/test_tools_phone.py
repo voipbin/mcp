@@ -1217,3 +1217,265 @@ class TestRoutingAndLifecycle:
             assert not s.hangup_requested
         finally:
             await teardown_manager(m)
+
+
+# ------------------------------------------------- review round 2 regressions
+
+
+class TestSlotAccounting:
+    async def test_hangup_event_during_talk_does_not_release_the_slot_twice(self, api, manager):
+        mock_number(api)
+
+        def gone(request):
+            # The hangup event arrives before /talk fails: mark_ended has
+            # already released the session's slot when _CallerGone is seen.
+            manager.on_event(call_event("x1", "hangup", direction="incoming", hangup_reason="normal"))
+            return err(404, "call not found")
+
+        api.post("/calls/x1/talk").mock(side_effect=gone)
+        api.get("/calls/x1").mock(return_value=ok({"status": "hangup"}))
+
+        def progress(request):
+            emit_later(manager, 0.01, call_event("x2", "progressing", direction="incoming"))
+            return httpx.Response(200)
+
+        api.post("/calls/x2/talk").mock(side_effect=progress)
+        api.get("/calls/x2").mock(return_value=ok({"status": "ringing"}))
+        emit_later(manager, 0.02, ringing("x1"))
+        emit_later(manager, 0.1, ringing("x2"))
+        result = await manager.wait_incoming(**await wait_args())
+        assert result["call_id"] == "x2"
+        assert manager.sessions["x1"].ended_reason == "normal"
+        live = [s for s in manager.sessions.values() if not s.ended]
+        assert manager.slots_in_use == len(live) == 1
+        assert manager.slot_underflows == 0
+
+    async def test_hangup_event_during_talk_with_no_free_slot_ends_the_wait(self, api):
+        m = make_manager(max_sessions=1)
+        try:
+            mock_number(api)
+
+            def gone(request):
+                m.on_event(call_event("x1", "hangup", direction="incoming"))
+                m.reserve_slot()  # another tool took the freed slot meanwhile
+                return err(404, "call not found")
+
+            api.post("/calls/x1/talk").mock(side_effect=gone)
+            api.get("/calls/x1").mock(return_value=ok({"status": "hangup"}))
+            emit_later(m, 0.02, ringing("x1"))
+            with pytest.raises(PhoneError) as excinfo:
+                await m.wait_incoming(**await wait_args())
+            assert excinfo.value.reason == "session_limit"
+            assert m.slots_in_use == 1 and m.waiters == {}
+            assert m.slot_underflows == 0
+        finally:
+            await teardown_manager(m)
+
+
+class TestSafetyGuards:
+    async def test_a_buffered_call_of_a_foreign_flow_is_not_answered(self, api, manager):
+        mock_number(api)
+        await manager.ensure_started()
+        manager.on_event(ringing("o1", flow_id="other-flow"))  # before the wait: buffered only
+        api.get("/calls/o1").mock(return_value=ok({"status": "ringing"}))
+        talk = api.post("/calls/o1/talk").mock(return_value=httpx.Response(200))
+        result = await manager.wait_incoming(**await wait_args(timeout_seconds=0.2))
+        assert result["timed_out"] is True
+        assert talk.call_count == 0
+        assert "o1" not in manager.sessions and "o1" not in manager.unclaimed
+
+    async def test_shutdown_during_the_buffered_call_check_answers_nothing(self, api, manager):
+        mock_number(api)
+        await manager.ensure_started()
+        manager.on_event(ringing("x1"))  # buffered only
+        entered = asyncio.Event()
+        api.get("/calls/x1").mock(side_effect=yielding_ok({"status": "ringing"}, delay=0.1, entered=entered))
+        talk = api.post("/calls/x1/talk").mock(return_value=httpx.Response(200))
+        waiting = asyncio.create_task(phone_tools.phone_wait_incoming("n1", timeout_seconds=5))
+        await entered.wait()
+        await manager.shutdown()
+        result = json.loads(await asyncio.wait_for(waiting, 2))
+        assert result["reason"] == "shutting_down"
+        assert talk.call_count == 0
+        assert manager.slots_in_use == 0
+
+    async def test_shutdown_during_get_customer_starts_no_call(self, api, manager):
+        entered = asyncio.Event()
+        api.get("/customer").mock(side_effect=yielding_ok({"id": "cid"}, delay=0.1, entered=entered))
+        post = api.post("/calls").mock(return_value=ok({"calls": [{"id": "c1"}]}))
+        starting = asyncio.create_task(phone_tools.phone_call_start("+1555", "tel", "+1666"))
+        await entered.wait()
+        await manager.shutdown()
+        result = json.loads(await asyncio.wait_for(starting, 2))
+        assert result["reason"] == "shutting_down"
+        assert post.call_count == 0
+        assert manager.slots_in_use == 0
+
+    async def test_no_request_at_all_once_shutdown_began(self, api, manager):
+        mock_number(api)
+        await manager.shutdown()
+        json.loads(await phone_tools.phone_call_start("+1555", "tel", "+1666"))
+        json.loads(await phone_tools.phone_wait_incoming("n1", timeout_seconds=1))
+        assert api.calls.call_count == 0  # not even GET /customer or /numbers
+        assert manager.hub is None
+
+    async def test_leftover_candidates_are_not_handed_to_unclaimed_during_shutdown(self, api, manager):
+        mock_number(api)
+        manager.config.unclaimed_incoming_grace_seconds = 60
+        waiting = asyncio.create_task(phone_tools.phone_wait_incoming("n1", timeout_seconds=5))
+        await wait_until(lambda: manager.waiters)
+        # The candidate is queued and shutdown begins before the waiter runs.
+        manager.on_event(ringing("x2"))
+        await manager.shutdown()
+        result = json.loads(await asyncio.wait_for(waiting, 2))
+        assert result["reason"] == "shutting_down"
+        assert "x2" not in manager.unclaimed
+        assert not [t for t in manager._tasks if not t.done() and t not in (manager._hub_task, manager._supervisor_task)]
+
+    async def test_the_hub_is_not_restarted_while_closing(self, api, manager):
+        await manager.ensure_started()
+        hub = manager.hub
+        await asyncio.sleep(0)
+        runs = hub.runs
+        await manager.shutdown()
+        await asyncio.sleep(0)
+        assert manager._hub_task.done()
+        manager.supervise_once()
+        await asyncio.sleep(0)
+        assert manager._hub_task.done()
+        assert hub.runs == runs
+
+    async def test_a_rejected_call_is_not_rejected_again_on_a_repeated_ringing(self, api, manager):
+        mock_number(api)
+        await manager.wait_incoming(**await wait_args(timeout_seconds=0.01))
+        get = api.get("/calls/u1").mock(return_value=ok({"status": "ringing"}))
+        api.post("/calls/u1/hangup").mock(return_value=ok({}))
+        manager.on_event(ringing("u1"))
+        await asyncio.sleep(0.25)
+        await settle(manager)
+        assert get.call_count == 1
+        manager.on_event(ringing("u1"))  # a late duplicate of the ringing event
+        assert "u1" not in manager.unclaimed
+
+
+class TestLegConfirmation:
+    async def test_a_leg_that_hung_up_right_after_answering_fails_the_start(self, api, manager):
+        await manager.ensure_started()
+        # Both events arrive before call_start routes the leg to the session.
+        manager.on_event(call_event("l1", "progressing", groupcall_id="g1"))
+        manager.on_event(call_event("l1", "hangup", groupcall_id="g1", hangup_reason="normal"))
+        api.post("/calls").mock(return_value=ok({"groupcalls": [{"id": "g1", "call_ids": ["l1"]}]}))
+        tr = api.post("/transcribes").mock(return_value=ok({"id": "tr1"}))
+        api.get("/calls/l1").mock(return_value=ok({"status": "hangup"}))
+        api.post("/calls/l1/hangup").mock(return_value=ok({}))
+        with pytest.raises(PhoneError) as excinfo:
+            await manager.call_start(
+                source_number="+1", destination_type="extension", destination_target="e",
+                language="en-US", voice_id="", max_duration_seconds=60, answer_timeout_seconds=5,
+            )
+        assert excinfo.value.reason == "call_failed"
+        assert tr.call_count == 0  # no media on a call that already ended
+        assert manager.sessions["l1"].ended
+        assert manager.slots_in_use == 0
+
+    async def test_hangup_during_media_start_fails_an_outgoing_call(self, api, manager):
+        api.post("/calls").mock(return_value=ok({"calls": [{"id": "c1"}]}))
+        api.get("/calls/c1").mock(return_value=ok({"status": "progressing"}))
+        api.post("/speakings/sp1/stop").mock(return_value=ok({}))
+        api.post("/calls/c1/hangup").mock(return_value=ok({}))
+
+        def hung_up(request):
+            # start_media's closing reconcile learns about the hangup.
+            manager.on_event(call_event("c1", "hangup", hangup_reason="normal"))
+            return ok({"result": []})
+
+        api.get("/transcripts").mock(side_effect=hung_up)
+        emit_later(manager, 0.01, call_event("c1", "progressing"))
+        result = json.loads(await phone_tools.phone_call_start("+1555", "tel", "+1666"))
+        assert result["reason"] == "call_failed"
+        assert result["hangup_reason"] == "normal"
+        assert manager.slots_in_use == 0
+
+    async def test_hangup_during_media_start_fails_an_incoming_answer(self, api, manager):
+        mock_number(api)
+        api.get("/calls/x1").mock(return_value=ok({"status": "ringing"}))
+        api.post("/speakings/sp1/stop").mock(return_value=ok({}))
+        api.post("/calls/x1/hangup").mock(return_value=ok({}))
+
+        def progress(request):
+            emit_later(manager, 0.01, call_event("x1", "progressing", direction="incoming"))
+            return httpx.Response(200)
+
+        def hung_up(request):
+            manager.on_event(call_event("x1", "hangup", direction="incoming", hangup_reason="normal"))
+            return ok({"result": []})
+
+        api.post("/calls/x1/talk").mock(side_effect=progress)
+        api.get("/transcripts").mock(side_effect=hung_up)
+        emit_later(manager, 0.02, ringing("x1"))
+        result = json.loads(await phone_tools.phone_wait_incoming("n1", timeout_seconds=5))
+        assert result["reason"] == "call_failed"
+        assert manager.slots_in_use == 0 and manager.waiters == {}
+
+
+class TestShutdownDrainsBackgroundCleanup:
+    async def test_shutdown_waits_for_a_running_speaking_stop(self, api, manager):
+        stop = api.post("/speakings/sp1/stop").mock(side_effect=yielding_ok(delay=0.3))
+        answered_session(manager)
+        manager.on_event(call_event("c1", "hangup"))  # spawns the stop in the background
+        await manager.shutdown()
+        assert stop.call_count == 1  # finished before shutdown returned
+
+    async def test_shutdown_waits_for_a_rejection_already_in_progress(self, api, manager):
+        manager.incoming_flow_ids.add("mf1")
+        entered = asyncio.Event()
+        api.get("/calls/u1").mock(side_effect=yielding_ok({"status": "ringing"}, delay=0.2, entered=entered))
+        hang = api.post("/calls/u1/hangup").mock(side_effect=yielding_ok(delay=0.1))
+        manager.on_event(ringing("u1"))
+        await entered.wait()  # past the grace: no longer in ``unclaimed``
+        assert "u1" not in manager.unclaimed
+        await manager.shutdown()
+        assert hang.call_count == 1
+
+    async def test_shutdown_retries_an_unconfirmed_speaking_stop(self, api, manager):
+        attempts = []
+
+        def flaky(request):
+            attempts.append(1)
+            return err(500, "stop failed") if len(attempts) == 1 else ok({})
+
+        api.post("/speakings/sp1/stop").mock(side_effect=flaky)
+        s = answered_session(manager)
+        manager.on_event(call_event("c1", "hangup"))
+        await settle(manager)
+        assert s.stale_speaking_ids == ["sp1"]  # the first stop failed
+        await manager.shutdown()
+        assert len(attempts) == 2 and s.stale_speaking_ids == []
+
+
+class TestIdleRefresh:
+    async def test_phone_status_of_a_call_refreshes_the_idle_timer(self, api):
+        clock = ManualClock()
+        m = make_manager(clock=clock, idle_hangup_seconds=300)
+        try:
+            s = answered_session(m)
+            clock.advance(299)
+            json.loads(await phone_tools.phone_status("c1"))
+            clock.advance(2)
+            m.supervise_once()
+            assert not s.hangup_requested
+        finally:
+            await teardown_manager(m)
+
+    async def test_the_end_of_a_tool_refreshes_the_idle_timer(self, api):
+        clock = ManualClock()
+        m = make_manager(clock=clock, idle_hangup_seconds=300)
+        try:
+            s = answered_session(m)
+            with s.activity():
+                clock.advance(1000)  # a long tool, no supervisor pass meanwhile
+            clock.advance(299)
+            m.supervise_once()
+            assert not s.hangup_requested
+        finally:
+            await teardown_manager(m)

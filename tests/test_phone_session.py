@@ -700,6 +700,52 @@ class TestToolTurns:
         finally:
             await teardown_manager(m)
 
+    async def test_phone_say_wait_cap_counts_from_the_call(self, api):
+        from voipbin_mcp.tools.phone import phone_say
+
+        clock = ManualClock()
+        m = make_manager(clock=clock, estimate_seconds=lambda t: 1000.0, say_wait_max=120.0)
+        try:
+            with respx.mock(base_url=BASE, assert_all_called=False) as mock:
+
+                def slow_say(request):
+                    clock.advance(120)  # lock wait and say requests used the whole cap
+                    return ok({})
+
+                mock.post("/speakings/sp1/say").mock(side_effect=slow_say)
+                answered_session(m)
+                # Counting the cap from after the say would wait 120 more
+                # (manual-clock) seconds, i.e. never return here.
+                result = json.loads(await asyncio.wait_for(phone_say("c1", "Hello there.", wait=True), 1.0))
+                assert result["still_speaking"] is True
+        finally:
+            await teardown_manager(m)
+
+    async def test_say_and_listen_keeps_the_reconcile_reserve_inside_the_cap(self, api):
+        from voipbin_mcp.tools.phone import phone_say_and_listen
+
+        m = make_manager(
+            say_and_listen_max_block=1.0, reconcile_timeout=0.5, listen_grace_seconds=0.1,
+            estimate_seconds=lambda t: 0.0,
+        )
+        try:
+            # Routes on the fixture router: a nested respx.mock() would lose
+            # to the fixture's fast /transcripts route.
+            api.post("/speakings/sp1/say").mock(return_value=ok({}))
+            # A reconcile that uses its whole budget.
+            transcripts = api.get("/transcripts").mock(side_effect=yielding_ok({"result": []}, delay=5.0))
+            answered_session(m)
+            started = time.monotonic()
+            result = json.loads(await phone_say_and_listen("c1", "Hi.", 120, 300))
+            took = time.monotonic() - started
+            assert result["timed_out"] is True
+            assert transcripts.called is False  # cut off by the reconcile budget
+            # 0.5 s listen + 0.5 s reconcile = 1.0 s; without the reserve
+            # the listen alone would take the 1.0 s, then 0.5 s more.
+            assert 0.9 <= took < 1.25, took
+        finally:
+            await teardown_manager(m)
+
     async def test_barge_in_after_say_without_wait_is_reported_by_the_next_listen(self, api, manager):
         from voipbin_mcp.tools.phone import phone_listen, phone_say
 

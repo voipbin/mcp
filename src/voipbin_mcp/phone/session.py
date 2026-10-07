@@ -149,6 +149,8 @@ class PhoneSession:
     def activity(self):
         """A tool is working on this session: the idle watchdog must wait."""
         self.active_ops += 1
+        # Defensive: while active_ops > 0 the supervisor also counts the
+        # session as active, so only the touch on exit is observable.
         self.touch()
         try:
             yield
@@ -306,6 +308,9 @@ class PhoneSession:
             new_id = str(created.get("id") or "") or None
             if new_id is None:
                 return
+            # A barge-in needs a live speaking_id, and this runs only while
+            # there is none, so the generation check is defensive; the ended
+            # check is the real path (hangup during the POST).
             if self.ended or gen != self.barge_gen:
                 if new_id not in self.stale_speaking_ids:
                     self.stale_speaking_ids.append(new_id)
@@ -320,7 +325,9 @@ class PhoneSession:
         except VoIPbinAPIError as exc:
             # Retry only when nothing new happened (same generation) and the
             # refusal is the "an earlier speaking is still active" one, after
-            # stopping every speaking whose stop is unconfirmed.
+            # stopping every speaking whose stop is unconfirmed. The
+            # generation checks here are defensive (no barge-in can happen
+            # without a speaking_id).
             if not (gen == self.barge_gen and self.stale_speaking_ids and looks_already_active(exc)):
                 raise
             for speaking_id in list(self.stale_speaking_ids):
@@ -371,6 +378,9 @@ class PhoneSession:
         interrupted = False
         sent = 0
         pieces = split_text(text)
+        # The generation checks before the first piece and at the top of the
+        # loop are defensive: a barge-in needs a live speaking_id, and one
+        # during a piece is caught right after its POST below.
         if gen == self.barge_gen and self.speaking_id is None:
             await self._create_speaking(gen)
         for piece in pieces:
@@ -412,6 +422,8 @@ class PhoneSession:
         gen = self.barge_gen
         while True:
             now = self.clock()
+            # A barge-in also sets speaking_until to now; the generation
+            # check is kept as a defensive, explicit condition.
             if gen != self.barge_gen or self.ended or now >= self.speaking_until:
                 return False
             if now - start >= max_wait:
