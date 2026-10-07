@@ -279,3 +279,19 @@ websockets 버전: `additional_headers` 인자를 쓰는 신규 asyncio client(`
 - Round 4: APPROVED. MINOR 9(수신 talk 실패 우선순위, groupcall 과설계 축소, 재-hangup shield와 인용 위치, stale_speaking_ids, 긴 발화 still_speaking, SIGTERM 진행 중 POST와 미청구 통화, 활성 수신 중 disable, listen timeout reconcile, 표 정합성과 9절 종결). 전부 반영.
 - Round 5: APPROVED. MINOR 8(3절 문구, 테스트 문구, groupcall 보조 GET 대상과 404, 대화 tool 취소 규칙, 블로킹 상한 근거 정합 130초와 wait 기본 120초, 수신 backstop 근거 채널 timeout, 4.2 필드 목록 동기화, 첫 wait 직전 도착 통화). 전부 반영.
 - 결과: Round 4, 5 연속 APPROVED로 디자인 리뷰 루프 종료.
+
+## 11. Implementation notes (구현 중 해소한 모호점)
+
+디자인 본문은 변경하지 않았고, 구현 시 명시가 없던 부분만 아래와 같이 정했다.
+
+1. `POST /calls/{id}/talk`는 본문 없이 200을 반환한다(`bin-api-manager/server/calls.go:349` `c.Status`). 공용 `VoIPbinClient.post`는 성공 응답을 JSON으로 디코드하므로, phone 패키지의 `api_post`가 성공 후 디코드 실패만 `{}`로 처리한다(client.py 무변경).
+2. speaking 생성 거부의 "이미 active" 판정: 오류가 RPC를 거쳐 오므로 메시지에 `already`가 있거나 status 409/500이면 해당으로 본다. 재시도 조건(같은 세대, `stale_speaking_ids` 비어 있지 않음, 1회)은 4.2 그대로다.
+3. "interim 진행 중"(listen timeout 연장, 턴 종료 판단 보조)의 정의: 마지막 transcript보다 새로운 interim이 `interim_active_seconds = 2.0`초 안에 있었던 경우. 상한 도달 시 heard가 비어 있으면 `timed_out: true`, interim 진행 중이었으면 `truncated: true`도 함께 표시한다. timeout 시 reconcile로 transcript를 회수하면 그것을 heard로 반환하고 `timed_out: false`로 둔다.
+4. signal handler는 /ws 연결을 여는 첫 phone tool(`phone_call_start`, `phone_wait_incoming`) 시점에 등록한다. 통화가 생길 수 있는 첫 시점이며, phone tool을 쓰지 않는 프로세스의 기존 동작이 바뀌지 않는다는 4.6의 의도와 같다.
+5. `deadline`(최대 통화 시각)은 응답 시각 + `max_duration_seconds`로 계산한다(발신 `sleep`도 응답 후 flow 실행 시점부터 흐름).
+6. groupcall 응답 대기의 1초 보조 폴링은 `GET /groupcalls/{id}`와 함께 아직 종료가 확인되지 않은 후보 call의 `GET /calls/{id}`도 조회한다("후보 판정에서 404 call은 종료로 센다" 규칙을 적용하기 위함).
+7. 미청구 수신 통화는 grace 만료 시점에 대기 맵에서 먼저 제거한 뒤(그 사이 새 대기자가 가져가지 못하게) shield 안에서 `GET`(ringing 확인) 후 hangup한다.
+8. 반환 형식 보충: `phone_incoming_configure`는 `enabled` 필드를 추가하고, `enabled=false`의 `previous_call_flow_id`는 제거한 MCP flow id다. `phone_call_start`/`phone_wait_incoming` 결과에 `events_connected`를 함께 넣고, `phone_say_and_listen`은 `still_speaking`을 항상(true/false) 넣는다.
+9. 시간 의존 상수, 시계, 발화 시간 추정 함수는 `voipbin_mcp.phone.PhoneConfig`로 주입한다. 정리 경로의 5초는 4.7 그대로 `anyio.move_on_after(5, shield=True)` 리터럴이다.
+10. `PINNED_CLAIMS`에는 Go 근거가 있는 백엔드 사실 2건을 고정했다: `phone_call_start`의 1시간 채널 상한(`start.go:289`, `:239`, `main.go:177`), `phone_wait_incoming`의 MCP 부재 시 ringing 잔존(`start.go:239`, `main.go:177`). "STT/TTS는 응답 후 생성해야 동작"은 실측 사실(분석 10절)로 Go 행 근거가 없어 docstring의 백엔드 주장으로 쓰지 않고 코드 주석에만 둔다.
+11. `main()`이 `anyio.run(_serve)`로 바뀌어 기존 `test_client_contract.py`의 startup 테스트는 `mcp.run` 대신 `mcp.run_stdio_async`를 stub한다. `scripts/fault_matrix.py`의 가짜 서버 tool 수 리터럴 58은 소스의 `@mcp.tool()` 수에서 계산하도록 바꿨다(66개가 되면서 정상 케이스가 모두 실패하던 문제).

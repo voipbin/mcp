@@ -94,9 +94,11 @@ jobs:
       # ResolutionImpossible; dropping "[dev]" installs no pytest and the test
       # step below silently becomes a no-op, which is the failure this whole
       # job exists to prevent. A glob cannot carry extras either.
+      # websockets is pinned to its floor too: the phone tools use the asyncio
+      # client's additional_headers argument, which first shipped in 13.0.
       - name: Install the wheel pinned to the floor
         run: |
-          pip install "mcp==${{ inputs.floor }}" \
+          pip install "mcp==${{ inputs.floor }}" "websockets==13.*" \
             "dist/voipbin_mcp-${{ inputs.version }}-py3-none-any.whl[dev]"
 
       - name: Assert the pin actually took
@@ -111,6 +113,10 @@ jobs:
           if got != want:
               sys.exit(f"expected mcp {want}, resolved {got}")
           print("pinned to", got)
+          ws = version("websockets")
+          if ws.split(".")[0] != "13":
+              sys.exit(f"expected websockets 13.*, resolved {ws}")
+          print("websockets pinned to", ws)
           PY
 
       - name: Import the server

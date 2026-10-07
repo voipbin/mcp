@@ -42,6 +42,12 @@ import time
 
 SMOKE = pathlib.Path(__file__).resolve().parent / "stdio_smoke.py"
 
+# The smoke gate compares tools/list against the @mcp.tool() count in the
+# source tree, so a healthy fake must serve exactly that many. Derived rather
+# than written as a literal, or adding a tool turns every healthy case red.
+TOOLS_DIR = pathlib.Path(__file__).resolve().parent.parent / "src" / "voipbin_mcp" / "tools"
+NTOOLS_EXPECTED = sum(p.read_text().count("@mcp.tool()") for p in TOOLS_DIR.glob("*.py"))
+
 # A fake console script answers initialize + tools/list, then misbehaves. The
 # body of each fake is spliced in where MISBEHAVE sits.
 FAKE = '''\
@@ -94,61 +100,61 @@ def _traceback_then(exit_code: int) -> str:
 # genuinely behaved, and a gate that reports RED here is crying wolf.
 CASES: dict[str, tuple[str, str, int, int]] = {
     # --- healthy servers: these must stay GREEN or the gate is useless noise
-    "clean": ("", "time.sleep(30)", 58, 0),
+    "clean": ("", "time.sleep(30)", NTOOLS_EXPECTED, 0),
     "chatty_stderr": (
         "",
         'sys.stderr.write("info " * 20000); sys.stderr.flush(); time.sleep(30)',
-        58,
+        NTOOLS_EXPECTED,
         0,
     ),
     "huge_stderr": (
         "",
         'sys.stderr.write("x" * (48 * 1024 * 1024)); sys.stderr.flush(); time.sleep(30)',
-        58,
+        NTOOLS_EXPECTED,
         0,
     ),
     "worker_in_group_healthy": (
         'subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)"])',
         "time.sleep(30)",
-        58,
+        NTOOLS_EXPECTED,
         0,
     ),
     # --- dead or wrong servers: every one of these was GREEN at some point
-    "crash_after_answering": ("", _traceback_then(0), 58, 1),
-    "exit_zero_silently": ("", "os._exit(0)", 58, 1),
-    "exit_nonzero": ("", "os._exit(3)", 58, 1),
+    "crash_after_answering": ("", _traceback_then(0), NTOOLS_EXPECTED, 1),
+    "exit_zero_silently": ("", "os._exit(0)", NTOOLS_EXPECTED, 1),
+    "exit_nonzero": ("", "os._exit(3)", NTOOLS_EXPECTED, 1),
     "crash_after_48mb_stderr": (
         "",
         'sys.stderr.write("x" * (48 * 1024 * 1024)); sys.stderr.flush(); '
         + _traceback_then(0).replace("\n", "\n"),
-        58,
+        NTOOLS_EXPECTED,
         1,
     ),
     "short_traceback_worker_holds_stderr": (
         'subprocess.Popen(["/bin/sleep", "120"])',
         _traceback_then(0),
-        58,
+        NTOOLS_EXPECTED,
         1,
     ),
     "worker_escapes_process_group": (
         'subprocess.Popen(["/bin/sleep", "120"], start_new_session=True)',
         _traceback_then(0),
-        58,
+        NTOOLS_EXPECTED,
         1,
     ),
     "worker_ignores_sigterm": (
         'subprocess.Popen([sys.executable, "-c", '
         '"import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(120)"])',
         _traceback_then(0),
-        58,
+        NTOOLS_EXPECTED,
         1,
     ),
     "zero_tools": ("", "time.sleep(30)", 0, 1),
-    "tool_count_short": ("", "time.sleep(30)", 57, 1),
+    "tool_count_short": ("", "time.sleep(30)", NTOOLS_EXPECTED - 1, 1),
     "ignores_sigterm": (
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
         "time.sleep(300)",
-        58,
+        NTOOLS_EXPECTED,
         0,
     ),
     "hangs_without_answering": ("", "time.sleep(300)", -1, 1),

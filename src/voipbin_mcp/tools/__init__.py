@@ -18,3 +18,4 @@ from voipbin_mcp.tools import ais  # noqa: F401
 from voipbin_mcp.tools import customer  # noqa: F401
 from voipbin_mcp.tools import tags  # noqa: F401
 from voipbin_mcp.tools import extensions  # noqa: F401
+from voipbin_mcp.tools import phone  # noqa: F401

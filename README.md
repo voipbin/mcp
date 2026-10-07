@@ -91,6 +91,7 @@ VOIPBIN_API_KEY=your-access-key voipbin-mcp
 | Customer | `get_customer` |
 | Tags | `list_tags`, `get_tag` |
 | Extensions | `list_extensions`, `get_extension` |
+| Phone (live conversation) | `phone_call_start`, `phone_incoming_configure`, `phone_wait_incoming`, `phone_say_and_listen`, `phone_say`, `phone_listen`, `phone_hangup`, `phone_status` |
 
 ## Example Usage
 
@@ -115,6 +116,51 @@ The AI uses `list_billings` to retrieve your billing history.
 > "Add a new contact named John with phone number +1234567890"
 
 The AI uses `create_contact`, passing the number as an address of type `tel`.
+
+## Live phone conversations
+
+The `phone_*` tools let the agent itself talk on a phone call: it speaks
+through text-to-speech and hears the other party through live speech-to-text.
+The MCP server owns the call session (the call, transcription, speech and the
+event stream), so every tool call is one conversational turn.
+
+**Cost.** A live conversation is billed as a call plus speech-to-text plus
+text-to-speech. Interim speech-recognition events are also delivered to your
+account's webhook if one is configured, so a long conversation can send a
+large number of webhook requests.
+
+**Outgoing call:**
+
+> "Call extension 2001 from +15550001234 and ask whether the delivery arrived."
+
+The agent calls `phone_call_start` (it returns once the call is answered),
+then repeats `phone_say_and_listen(call_id, text)` for each turn, and ends with
+`phone_hangup`.
+
+**Incoming calls:**
+
+1. `phone_incoming_configure(number_id, enabled=true)` once. This replaces the
+   number's call flow with one that keeps callers ringing until the agent
+   answers; the original flow id is stored on the replacement flow.
+2. `phone_wait_incoming(number_id)` answers the next call with a greeting.
+   Call it again to wait for the next one.
+3. `phone_incoming_configure(number_id, enabled=false)` gives the number back
+   its original call flow.
+
+Incoming calls are handled only while an MCP server is running and waiting.
+Only one MCP process may wait on a given number. While the server runs, an
+incoming call that no `phone_wait_incoming` picks up within 15 seconds is
+rejected.
+
+**Safety limits.** At most 4 concurrent calls per server process. A call is
+hung up after 5 minutes without any phone tool call, at its
+`max_duration_seconds` (1 hour at most), and when the MCP server exits (stdin
+closed, SIGTERM or SIGINT).
+
+**Claude Code.** Allow the phone tools ahead of time (for example with
+`/permissions` or an allowlist in your settings). A permission prompt is not
+skipped during a call: the time it waits adds to the pause the other party
+hears and counts towards the 5 minute idle hangup.
 
 ## Configuration reference
 
@@ -149,6 +195,25 @@ key; that value is stored by the API and can appear in responses.
   empty object.
 - Attachments on `send_email` reference existing VoIPbin objects (such as a
   recording) rather than uploading file contents.
+- Live phone conversations take about 4 seconds per turn: roughly 1 second to
+  finish transcribing, the agent's own thinking time, and about 1 second
+  before synthesized speech is heard.
+- The platform reports no "speech finished" event, so when the agent stops
+  talking is estimated from the text length. Barge-in (stopping the agent's
+  speech when the other party talks over it) can be slightly early or late.
+- On a speakerphone the agent's own voice can echo back and be transcribed;
+  such speech is marked `during_agent_speech`.
+- Without a running MCP server, an incoming call to a number prepared with
+  `phone_incoming_configure` keeps ringing (up to the platform's one hour call
+  timeout), and the caller may hear no ringback tone.
+- Where the aws speech-to-text provider is not available (some self-hosted
+  setups), transcription silently falls back to a provider that stops after
+  about 5 minutes. This cannot be detected through the API; phone results
+  include `stt_silent_seconds` when nothing has been recognised for 4 minutes.
+- If the MCP server is killed (SIGKILL), its calls stay up until their
+  maximum duration. The longest incoming conversation is one hour minus the
+  time the call spent ringing.
+- PSTN calling on the hosted platform follows the existing account policy.
 
 ## Getting an API Key
 

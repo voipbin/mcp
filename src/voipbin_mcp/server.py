@@ -4,6 +4,7 @@ import json
 import os
 from importlib.metadata import PackageNotFoundError, version
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 
 from voipbin_mcp.client import VALID_AUTH_TRANSPORTS, VoIPbinClient
@@ -56,6 +57,23 @@ def validate_page_size(page_size: int) -> int:
 import voipbin_mcp.tools  # noqa: E402, F401
 
 
+async def _serve():
+    """Serve stdio, then hang up any live phone call this process still owns.
+
+    mcp 1.27.0+ cancels in-flight tool handlers on stdin EOF; each cancelled
+    phone tool hangs up its own call, and this finally catches whatever is
+    left (answered sessions, pending outgoing calls, unclaimed ringing calls)
+    on the same event loop and the same HTTP client. With no phone session it
+    returns immediately, without creating a client or touching the network.
+    """
+    try:
+        await mcp.run_stdio_async()
+    finally:
+        from voipbin_mcp.phone.manager import shutdown_if_started
+
+        await shutdown_if_started()
+
+
 def main():
     """Run the VoIPbin MCP server over stdio."""
     # Validate the auth transport before serving. The HTTP client is built
@@ -69,7 +87,7 @@ def main():
             "Leave it unset to send the key as a cookie."
         )
 
-    mcp.run(transport="stdio")
+    anyio.run(_serve)
 
 
 if __name__ == "__main__":
