@@ -139,3 +139,25 @@ Claude Code 같은 외부 AI agent가 VoIPBin MCP 서버의 tool만으로 직접
 - Round 5: APPROVED. MINOR 6(say 5000바이트, speech payload 필드, Talk runNext 근거, call 이중 구독 키와 선도착 버퍼링, 중복 문단, 긴 대기 후 say 실측). 전부 반영.
 - Round 6: APPROVED. MINOR 3(silence 중간 fallback, Talk runNext 근거 코드 확인으로 격상, 바이트 기준 오류 문구). 전부 반영.
 - 결과: Round 5, 6 연속 APPROVED로 분석 리뷰 루프 종료(최소 2회 충족).
+
+## 9. 실측 결과 (2026-10-07, 운영 api.voipbin.net, 분석 리뷰 종료 후 수행)
+
+방법: 임시 extension을 API로 생성하고 로컬 SIP UA(pyVoIP 1.6.8, NAT 우회 패치)로 등록, `POST /calls`(source=고객 virtual number, destination=`{"type":"extension","target_name":...}`, inline `sleep` action)로 발신. 컨트롤러가 /transcribes(direction=in), /speakings(direction=out)를 구동하고 /ws를 이벤트 타입별 연결로 구독. UA는 수신 오디오를 녹음(RMS 측정)하고 정해진 시점에 사람 음성(영문 TTS 7.4초)을 송출. 실험 후 extension 삭제, speaking 전부 stopped 확인.
+
+| # | 항목 | 결과 |
+|---|---|---|
+| 0 | MCP 런타임 | FastMCP stdio에서 백그라운드 asyncio task가 tool 호출 사이 유지, 블로킹 중 이벤트 큐 버퍼링 정상. **mcp 서버 1.2.0은 요청을 직렬 처리**(블로킹 tool 중 다른 tool이 3초 대기), 1.3.0 이상은 동시 처리 → pyproject 하한 상향 필요. Claude Code 2.1.220에서 130초 블로킹 tool이 timeout 없이 완료. Claude Code의 tool 호출 간 턴 지연(짧은 응답 작성 포함) 약 1.7~2.7초. |
+| 1 | 통화 유지 + TTS 청취 | inline sleep으로 통화 유지 확인. speaking direction=`out`의 say가 UA에서 약 0.9~1.3초 후 오디오로 수신(RMS로 확인, silence 보조 불필요). 25초 무발화 후 say도 정상(keepalive 동작, 단 keepalive 시점에 짧은 잡음 1회 관측). |
+| 2 | /ws 이벤트 | 4파트 이벤트 타입 구독(`call:call_progressing`, `call:call_hangup`, `transcript:transcript_created`, `transcribe:transcribe_speech_*`) 모두 수신, 각 1회(중복 없음). 3파트 `customer_id:<cid>:call` 구독은 **같은 이벤트 2회 수신 실측 확인**. call 이벤트 지연 약 0.2~0.4초. transcribe/transcript payload에는 `owner_id` 없음, call payload의 owner_id는 nil UUID. |
+| 2a | extension 발신 시 call_id | `POST /calls`(destination extension) 응답은 `calls: []`, `groupcalls: [1]`. call payload의 `groupcall_id`는 nil. **call_id는 `GET /groupcalls/{id}`의 `call_ids`로 획득**(응답 직후 0.2초 내 확보). tel/sip 목적지는 `calls`에 바로 들어올 것으로 추정(미실측). |
+| 3 | G4 STT 5분 | **GCP: 약 5분 이후 전사가 조용히 멈춤 확인**(330초 시점 발화 미전사, transcribe status는 progressing 유지, 종료 후 done). **AWS(provider=aws 명시): 330초 시점 발화 정상 전사.** → provider=aws 고정으로 G4 해소, 2순위 우회 불필요. AWS도 interim 이벤트 발생. |
+| 4 | TTS의 STT 혼입 | direction=in 전사에 agent TTS 문장은 한 번도 나타나지 않음(GCP, AWS 모두). |
+| 5 | 시작 시점 | transcribe를 응답 전(dialing) 시작 가능, 응답 후 정상 전사. 사람 발화 시작부터 첫 interim 약 0.8초(GCP), 발화 종료부터 transcript_created 약 0.5~1.1초. |
+| G3 | barge-in | **flush는 재생 중인 오디오를 끊지 못함**(실측). **stop은 0.5초 이내 즉시 무음.** stop 후 새 speaking 생성+say API 0.6초, 첫 오디오까지 추가 약 0.3~0.9초. |
+
+설계 함의:
+- STT provider는 aws 고정(G4 해소). 단 aws 미초기화 시 조용히 GCP로 fallback하므로 transcribe 응답의 `provider` 필드를 검증하고, gcp로 떨어지면 통화 길이를 5분 미만으로 제한하거나 경고한다.
+- barge-in은 stop 후 재생성으로 구현(flush 사용 안 함).
+- extension 목적지는 groupcall 경유 call_id 조회가 필요.
+- mcp 의존성 하한을 1.3.0 이상(권장: 검증한 최신 계열)으로 상향.
+- 턴 지연 합계 추정: 사람 발화 종료→transcript 약 1초 + agent 추론 약 2초 + TTS 첫 오디오 약 1초 = 약 4초.
