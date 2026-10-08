@@ -3,6 +3,7 @@
 import asyncio
 import json
 import signal
+import time
 
 import anyio
 import httpx
@@ -21,6 +22,7 @@ from phone_fakes import (
     ok,
     settle,
     teardown_manager,
+    transcript,
     yielding,
     yielding_ok,
 )
@@ -664,6 +666,7 @@ class TestIncoming:
                 await m.wait_incoming(**await wait_args())
             assert excinfo.value.reason == "session_limit"
             assert m.waiters == {}
+            m.slots_in_use = 0  # the slot taken by hand above
         finally:
             await teardown_manager(m)
 
@@ -976,11 +979,16 @@ class TestShutdown:
             api.post("/speakings/sp1/stop").mock(side_effect=yielding_ok())
             hang = api.post("/calls/c1/hangup").mock(side_effect=yielding_ok())
             answered_session(m)
+            await m.ensure_started()  # hub and supervisor running too
+            started = time.monotonic()
             m._on_signal(signal.SIGTERM)
             task = m._signal_task
             m._on_signal(signal.SIGTERM)
             assert m._signal_task is task
             await task
+            # The drain skips the signal task running it (and the hub and
+            # supervisor), or it would wait out the whole 5 s budget.
+            assert time.monotonic() - started < 1.0
             assert exits == [128 + signal.SIGTERM]
             assert hang.call_count == 1
         finally:
@@ -1268,6 +1276,7 @@ class TestSlotAccounting:
             assert excinfo.value.reason == "session_limit"
             assert m.slots_in_use == 1 and m.waiters == {}
             assert m.slot_underflows == 0
+            m.release_slot()  # the slot the other tool took
         finally:
             await teardown_manager(m)
 
@@ -1319,9 +1328,11 @@ class TestSafetyGuards:
         assert api.calls.call_count == 0  # not even GET /customer or /numbers
         assert manager.hub is None
 
-    async def test_leftover_candidates_are_not_handed_to_unclaimed_during_shutdown(self, api, manager):
+    async def test_leftover_candidates_are_rejected_at_once_during_shutdown(self, api, manager):
         mock_number(api)
         manager.config.unclaimed_incoming_grace_seconds = 60
+        get = api.get("/calls/x2").mock(return_value=ok({"status": "ringing"}))
+        hang = api.post("/calls/x2/hangup").mock(return_value=ok({}))
         waiting = asyncio.create_task(phone_tools.phone_wait_incoming("n1", timeout_seconds=5))
         await wait_until(lambda: manager.waiters)
         # The candidate is queued and shutdown begins before the waiter runs.
@@ -1329,7 +1340,10 @@ class TestSafetyGuards:
         await manager.shutdown()
         result = json.loads(await asyncio.wait_for(waiting, 2))
         assert result["reason"] == "shutting_down"
+        # No grace timer (it would outlive shutdown): rejected right away.
         assert "x2" not in manager.unclaimed
+        await settle(manager)
+        assert get.call_count == 1 and hang.call_count == 1
         assert not [t for t in manager._tasks if not t.done() and t not in (manager._hub_task, manager._supervisor_task)]
 
     async def test_the_hub_is_not_restarted_while_closing(self, api, manager):
@@ -1479,3 +1493,181 @@ class TestIdleRefresh:
             assert not s.hangup_requested
         finally:
             await teardown_manager(m)
+
+
+# ------------------------------------------------- review round 3 regressions
+
+
+class TestShutdownVsNewRinging:
+    async def _shutdown_with_a_new_ringing(self, api, m, status):
+        attempts = []
+
+        def flaky(request):
+            attempts.append(1)
+            return err(500, "stop failed") if len(attempts) == 1 else ok({})
+
+        api.post("/speakings/sp1/stop").mock(side_effect=flaky)
+        api.post("/calls/c1/hangup").mock(side_effect=yielding_ok(delay=0.05))
+        s = answered_session(m)
+        m.on_event(call_event("c1", "hangup"))
+        await settle(m)
+        assert s.stale_speaking_ids == ["sp1"]  # the first stop failed
+        # A live call whose hangup takes 0.1 s, and a ringing call on a flow
+        # this process waited on that arrives meanwhile (the hub still runs).
+        answered_session(m, call_id="c2", transcribe_id="tr2", speaking_id="sp2")
+        api.post("/speakings/sp2/stop").mock(return_value=ok({}))
+        api.post("/calls/c2/hangup").mock(side_effect=yielding_ok(delay=0.1))
+        get = api.get("/calls/u9").mock(side_effect=yielding_ok({"status": status}))
+        hang = api.post("/calls/u9/hangup").mock(return_value=ok({}))
+        emit_later(m, 0.02, ringing("u9"))
+        started = time.monotonic()
+        await m.shutdown()
+        elapsed = time.monotonic() - started
+        # The drain must not wait out a grace timer (15 s > the 5 s budget),
+        # so the unconfirmed stop is still retried.
+        assert elapsed < 1.0
+        assert len(attempts) == 2 and s.stale_speaking_ids == []
+        assert get.call_count == 1
+        assert "u9" not in m.unclaimed
+        return hang
+
+    async def test_a_ringing_call_during_shutdown_is_rejected_at_once(self, api):
+        m = make_manager(unclaimed_incoming_grace_seconds=15.0)
+        try:
+            m.incoming_flow_ids.add("mf1")
+            hang = await self._shutdown_with_a_new_ringing(api, m, "ringing")
+            assert hang.call_count == 1
+        finally:
+            await teardown_manager(m)
+
+    async def test_a_call_answered_elsewhere_during_shutdown_is_not_rejected(self, api):
+        m = make_manager(unclaimed_incoming_grace_seconds=15.0)
+        try:
+            m.incoming_flow_ids.add("mf1")
+            hang = await self._shutdown_with_a_new_ringing(api, m, "progressing")
+            assert hang.call_count == 0
+        finally:
+            await teardown_manager(m)
+
+    async def test_shutdown_with_the_hub_and_supervisor_running_is_quick(self, api, manager):
+        await manager.ensure_started()
+        assert not manager._hub_task.done() and not manager._supervisor_task.done()
+        started = time.monotonic()
+        await manager.shutdown()
+        assert time.monotonic() - started < 1.0
+        await asyncio.sleep(0)
+        assert manager._hub_task.done() and manager._supervisor_task.done()
+
+
+class TestPollFallback:
+    async def test_outgoing_answer_is_found_by_polling_without_an_event(self, api, manager):
+        api.post("/calls").mock(return_value=ok({"calls": [{"id": "c1"}]}))
+        get = api.get("/calls/c1").mock(return_value=ok({"status": "progressing"}))
+        result = json.loads(await phone_tools.phone_call_start("+1555", "tel", "+1666", answer_timeout_seconds=5))
+        assert result["status"] == "answered"  # no progressing event was ever sent
+        assert get.call_count >= 1
+        assert manager.sessions["c1"].state == "answered"
+
+    async def test_incoming_answer_is_found_by_polling_without_an_event(self, api, manager):
+        mock_number(api)
+        api.post("/calls/x1/talk").mock(return_value=httpx.Response(200))
+        get = api.get("/calls/x1").mock(return_value=ok({"status": "progressing"}))
+        emit_later(manager, 0.02, ringing("x1"))
+        result = json.loads(await phone_tools.phone_wait_incoming("n1", timeout_seconds=5))
+        assert result["status"] == "answered"
+        assert get.call_count >= 1
+
+
+class TestRound3Gaps:
+    async def test_caller_gone_then_timeout_returns_the_slot(self, api, manager):
+        mock_number(api)
+        api.post("/calls/i1/talk").mock(return_value=err(400, "gone"))
+        api.get("/calls/i1").mock(return_value=ok({"status": "hangup"}))
+        emit_later(manager, 0.02, ringing("i1"))
+        result = json.loads(await phone_tools.phone_wait_incoming("n1", timeout_seconds=1))
+        assert result["timed_out"] is True
+        assert manager.sessions["i1"].ended_reason == "caller_hangup"
+        assert manager.slots_in_use == 0 and manager.slot_underflows == 0
+
+    async def test_hangup_during_speaking_creation_is_call_failed(self, api, manager):
+        api.post("/calls").mock(return_value=ok({"calls": [{"id": "c1"}]}))
+        api.get("/calls/c1").mock(return_value=ok({"status": "progressing"}))
+        stop = api.post("/speakings/sp1/stop").mock(return_value=ok({}))
+        api.post("/calls/c1/hangup").mock(return_value=ok({}))
+
+        def hung_up(request):
+            manager.on_event(call_event("c1", "hangup", hangup_reason="normal"))
+            return ok({"id": "sp1"})
+
+        api.post("/speakings").mock(side_effect=hung_up)
+        result = json.loads(await phone_tools.phone_call_start("+1555", "tel", "+1666"))
+        assert result["reason"] == "call_failed"  # not media_start_failed
+        assert result["hangup_reason"] == "normal"
+        assert stop.call_count == 1  # the late speaking is stopped
+        assert manager.slots_in_use == 0
+
+    async def test_retention_purge_drops_the_transcribe_route(self, api):
+        clock = ManualClock()
+        m = make_manager(clock=clock, ended_retention_seconds=60)
+        try:
+            api.post("/speakings/sp1/stop").mock(return_value=ok({}))
+            s = answered_session(m)
+            m.on_event(call_event("c1", "hangup"))
+            clock.advance(61)
+            m.supervise_once()
+            assert "c1" not in m.sessions
+            assert "tr1" not in m._by_transcribe
+            m.on_event(transcript("t1", "late words"))  # no longer routed
+            assert list(s.transcripts) == []
+        finally:
+            await teardown_manager(m)
+
+    async def test_an_ended_call_never_reports_still_speaking(self, api):
+        m = make_manager(estimate_seconds=lambda text: 1000.0)
+        try:
+            s = answered_session(m)
+            s.speaking_until = s.clock() + 1000  # an earlier phone_say still playing
+            api.post("/speakings/sp1/stop").mock(return_value=ok({}))
+
+            def hung_up(request):
+                m.on_event(call_event("c1", "hangup", hangup_reason="normal"))
+                return ok({})
+
+            api.post("/speakings/sp1/say").mock(side_effect=hung_up)
+            result = json.loads(await phone_tools.phone_say_and_listen("c1", "Hello there.", listen_timeout_seconds=1))
+            assert result["call_ended"] is True
+            assert result["still_speaking"] is False
+            assert s.speaking_until <= s.clock()
+        finally:
+            await teardown_manager(m)
+
+    async def test_a_repeated_ringing_does_not_restart_the_grace(self, api, manager):
+        manager.incoming_flow_ids.add("mf1")
+        api.get("/calls/u1").mock(return_value=ok({"status": "ringing"}))
+        hang = api.post("/calls/u1/hangup").mock(return_value=ok({}))
+        manager.on_event(ringing("u1"))
+        await asyncio.sleep(0.1)  # grace is 0.15 s
+        manager.on_event(ringing("u1"))  # a duplicate of the ringing event
+        await asyncio.sleep(0.1)
+        # Rejected on the first timer (a restarted grace would end at 0.25 s).
+        assert hang.call_count == 1
+        await settle(manager)
+        assert hang.call_count == 1
+
+    async def test_a_repeated_ringing_during_shutdown_is_rejected_once(self, api, manager):
+        await manager.shutdown()  # no state: only marks the manager closing
+        manager.incoming_flow_ids.add("mf1")
+        get = api.get("/calls/u1").mock(return_value=ok({"status": "ringing"}))
+        hang = api.post("/calls/u1/hangup").mock(return_value=ok({}))
+        manager.on_event(ringing("u1"))
+        manager.on_event(ringing("u1"))
+        await settle(manager)
+        assert get.call_count == 1 and hang.call_count == 1
+
+    def test_an_extra_slot_release_is_counted_not_applied(self):
+        m = make_manager()
+        try:
+            m.release_slot()
+            assert m.slots_in_use == 0 and m.slot_underflows == 1
+        finally:
+            reset_manager(None)

@@ -233,6 +233,8 @@ class PhoneSession:
         self.changed.notify()
 
     def _check_barge_in(self, message: str, now: float) -> None:
+        # A speaking_id exists only while answered, so the state check is
+        # defensive.
         if not self.barge_in or self.state != "answered" or self.speaking_id is None:
             return
         text = message.strip()
@@ -358,7 +360,9 @@ class PhoneSession:
 
         await self._post_and_record(self.barge_gen)
         if self.ended:
-            raise PhoneError("the call ended while media was starting", "call_failed")
+            raise PhoneError(
+                "the call ended while media was starting", "call_failed", hangup_reason=self.ended_reason
+            )
         if not self.speaking_id:
             raise PhoneError("the speaking response carried no id", "media_start_failed")
 
@@ -399,9 +403,10 @@ class PhoneSession:
                     interrupted = True
                     break
                 raise
-            if gen != self.barge_gen:
-                # The callee spoke while this piece was in flight: no retry,
-                # no further pieces.
+            if gen != self.barge_gen or self.ended:
+                # The callee spoke (or hung up) while this piece was in
+                # flight: no retry, no further pieces, and no playback time
+                # added to a call that has ended.
                 interrupted = True
                 break
             now = self.clock()

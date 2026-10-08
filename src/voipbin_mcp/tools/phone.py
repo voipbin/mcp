@@ -349,6 +349,7 @@ async def phone_say(call_id: str, text: str, wait: bool = False, barge_in: bool 
                 spoken = await session.say(text, bool(barge_in))
                 result = {"queued": spoken["queued"], "estimated_seconds": spoken["estimated_seconds"]}
                 if wait:
+                    # Clamped for clarity; wait_spoken treats a negative wait as 0.
                     remaining = max(0.0, wait_until - session.clock())
                     result["still_speaking"] = await session.wait_spoken(remaining)
                 if session.consume_barge_in():

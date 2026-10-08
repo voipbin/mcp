@@ -95,7 +95,9 @@ async def teardown_manager(manager: SessionManager) -> None:
     reset_manager(None)
     # Every slot release must pair with a reserve (release_slot counts extras).
     assert manager.slot_underflows == 0, "phone session slot released more often than reserved"
-    assert manager.slots_in_use >= 0
+    # No slot may leak: once the tasks are gone only live sessions hold one.
+    held = {id(s) for s in list(manager.sessions.values()) + list(manager.pending) if s.slot_held}
+    assert manager.slots_in_use == len(held), f"{manager.slots_in_use} slots in use for {len(held)} live sessions"
 
 
 async def settle(manager: SessionManager, rounds: int = 3) -> None:

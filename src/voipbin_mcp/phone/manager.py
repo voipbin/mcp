@@ -162,6 +162,7 @@ class SessionManager:
             or self.unclaimed
             or self.waiters
             or self.inflight_posts
+            # done() matters only until the done callback discards the task.
             or any(not t.done() for t in self._tasks)
         )
 
@@ -301,6 +302,8 @@ class SessionManager:
 
     def _route_incoming(self, event: CallEvent) -> None:
         if event.status == "ringing":
+            # The sessions check is defensive: an incoming session's call is
+            # marked handled first (it matters only past dedupe_size).
             if (
                 event.flow_id not in self.incoming_flow_ids
                 or event.id in self._handled
@@ -327,6 +330,14 @@ class SessionManager:
                         waiter.candidates.remove(candidate)
 
     def _start_unclaimed(self, event: CallEvent) -> None:
+        if self._closing:
+            # Shutdown already took the unclaimed list, and its drain must
+            # not wait out a grace timer (longer than its whole budget): no
+            # waiter can take the call any more, so reject it now (only if
+            # it is still ringing).
+            self._mark_handled(event.id)
+            self._spawn(self._reject_if_ringing(event.id))
+            return
         entry = UnclaimedCall(event)
         self.unclaimed[event.id] = entry
         entry.task = self._spawn(self._reject_later(entry))
@@ -611,6 +622,7 @@ class SessionManager:
                 session.mark_ended(reason)
                 if session.groupcall_id:
                     await self._hangup_groupcall_now(session.groupcall_id, candidates)
+        # Defensive: ending the session already left ``pending`` (on_end).
         self.pending.discard(session)
 
     async def _hangup_groupcall_now(self, groupcall_id: str, known: list[str]) -> None:
@@ -789,6 +801,7 @@ class SessionManager:
             # leaves it for the unclaimed handover in wait_incoming's finally.
             while waiter.buffered:
                 event = waiter.buffered[0]
+                # Defensive sessions check, as in _route_incoming.
                 if event.id in self._handled or event.id in self.sessions:
                     waiter.buffered.pop(0)
                     continue
@@ -906,7 +919,8 @@ class SessionManager:
                 del self.waiters[number_id]
             # Ringing calls this waiter saw but did not take (live candidates,
             # and pre-wait buffered ones left by a cancellation or by taking
-            # another call first) fall back to the unclaimed rejection path.
+            # another call first) fall back to the unclaimed rejection path
+            # (rejected at once, without a grace, once shutdown began).
             leftovers = list(waiter.buffered) + list(waiter.candidates)
             waiter.buffered.clear()
             waiter.candidates.clear()
@@ -914,10 +928,9 @@ class SessionManager:
                 if (
                     event.id not in self._handled
                     and event.id not in self.sessions
+                    # Defensive: a candidate or buffered call is never also
+                    # in ``unclaimed`` (routing picks one of the two).
                     and event.id not in self.unclaimed
-                    # shutdown already took the unclaimed list; a timer
-                    # started now would outlive it.
-                    and not self._closing
                 ):
                     self._start_unclaimed(event)
             if slot_owned:
@@ -950,16 +963,22 @@ class SessionManager:
     # ------------------------------------------------------------- shutdown
 
     def _all_sessions(self) -> list[PhoneSession]:
+        # Pending (unresolved groupcall) sessions own no speaking or task
+        # yet; they are included defensively.
         seen: dict[int, PhoneSession] = {}
         for session in list(self.sessions.values()) + list(self.pending):
             seen[id(session)] = session
         return list(seen.values())
 
     def _background_tasks(self) -> set[asyncio.Task]:
+        # The hub and supervisor never end by themselves, and the signal task
+        # is the one running shutdown (so is the current task then): waiting
+        # on any of them would burn the whole budget.
         skip = {self._hub_task, self._supervisor_task, self._signal_task, asyncio.current_task()}
         tasks = {t for t in self._tasks if t not in skip}
         for session in self._all_sessions():
             tasks |= set(session._tasks)
+            # Defensive: pending_stop is spawned into session._tasks too.
             if session.pending_stop is not None:
                 tasks.add(session.pending_stop)
         return {t for t in tasks if not t.done()}
@@ -993,6 +1012,8 @@ class SessionManager:
                 for session in list(self.sessions.values()):
                     if not session.ended:
                         tg.start_soon(session._hangup_now, "shutdown")
+                # An ended session has already left ``pending`` (on_end); the
+                # ended check below is defensive.
                 for session in list(self.pending):
                     if not session.call_id and session.groupcall_id and not session.ended:
                         session.mark_ended("shutdown")
