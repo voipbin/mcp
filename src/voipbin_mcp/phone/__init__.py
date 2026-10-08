@@ -32,6 +32,9 @@ class PhoneConfig:
     max_sessions: int = 4
     idle_hangup_seconds: float = 300.0
     unclaimed_incoming_grace_seconds: float = 15.0
+    # During shutdown a ringing call is rechecked after this delay before it
+    # is rejected (another MCP process may answer it); within the 5 s budget.
+    shutdown_reject_delay: float = 1.0
     stt_silent_warn_seconds: float = 240.0
     ended_retention_seconds: float = 60.0
     # /ws event handling (section 4.1).

@@ -60,6 +60,7 @@ def fast_config(**overrides) -> PhoneConfig:
         listen_grace_seconds=0.3,
         interim_active_seconds=0.2,
         unclaimed_incoming_grace_seconds=0.15,
+        shutdown_reject_delay=0.02,
         events_ready_timeout=0.5,
         reconcile_timeout=0.5,
         estimate_seconds=lambda text: 0.2,

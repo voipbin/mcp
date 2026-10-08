@@ -1671,3 +1671,206 @@ class TestRound3Gaps:
             assert m.slots_in_use == 0 and m.slot_underflows == 1
         finally:
             reset_manager(None)
+
+
+# ------------------------------------------------- review round 4 regressions
+
+
+def leg_routes(api, *legs):
+    """Legs that ring until POST /calls/{id}/hangup (the cleanup) ends them."""
+    state = {leg: "ringing" for leg in legs}
+    for leg in legs:
+        api.get(f"/calls/{leg}").mock(side_effect=lambda request, leg=leg: ok({"status": state[leg]}))
+
+        def hang(request, leg=leg):
+            state[leg] = "hangup"
+            return ok({})
+
+        api.post(f"/calls/{leg}/hangup").mock(side_effect=hang)
+    return state
+
+
+class TestRound4:
+    async def test_a_leg_event_before_the_leg_is_a_candidate_is_rescanned(self, api, manager):
+        # Leg events carry no groupcall_id. l2 answers before the poll lists
+        # it; its GET still says ringing, so only the buffer can confirm it.
+        api.post("/calls").mock(return_value=ok({"groupcalls": [{"id": "g1", "call_ids": ["l1"]}]}))
+        api.get("/groupcalls/g1").mock(return_value=ok({"status": "progressing", "call_ids": ["l1", "l2"]}))
+        api.get("/calls/l1").mock(return_value=ok({"status": "ringing"}))
+        api.get("/calls/l2").mock(return_value=ok({"status": "ringing"}))
+        emit_later(manager, 0.01, call_event("l2", "progressing"))
+        started = time.monotonic()
+        result = await manager.call_start(
+            source_number="+1", destination_type="extension", destination_target="e",
+            language="en-US", voice_id="", max_duration_seconds=60, answer_timeout_seconds=1,
+        )
+        assert result["call_id"] == "l2"
+        assert time.monotonic() - started < 0.5  # found right after the first poll
+        assert manager.sessions["l2"].state == "answered"
+
+    async def test_a_leg_hangup_before_the_leg_is_a_candidate_counts(self, api, manager):
+        api.post("/calls").mock(return_value=ok({"groupcalls": [{"id": "g1", "call_ids": ["l1"]}]}))
+        api.get("/groupcalls/g1").mock(return_value=ok({"status": "progressing", "call_ids": ["l1", "l2"]}))
+        leg_routes(api, "l1", "l2")
+        api.post("/groupcalls/g1/hangup").mock(return_value=ok({}))
+        emit_later(manager, 0.01, call_event("l2", "hangup"))
+        emit_later(manager, 0.12, call_event("l1", "hangup"))
+        started = time.monotonic()
+        with pytest.raises(PhoneError) as excinfo:
+            await manager.call_start(
+                source_number="+1", destination_type="extension", destination_target="e",
+                language="en-US", voice_id="", max_duration_seconds=60, answer_timeout_seconds=1,
+            )
+        # Every leg ended: call_failed well before the 1 s answer timeout.
+        assert excinfo.value.reason == "call_failed"
+        assert time.monotonic() - started < 0.8
+
+    async def test_single_call_hangup_found_only_by_the_poll_is_call_failed(self, api, manager):
+        api.post("/calls").mock(return_value=ok({"calls": [{"id": "c1"}]}))
+        api.get("/calls/c1").mock(return_value=ok({"status": "hangup", "hangup_reason": "busy"}))
+        api.post("/calls/c1/hangup").mock(return_value=ok({}))
+        started = time.monotonic()
+        result = json.loads(await phone_tools.phone_call_start("+1555", "tel", "+1666", answer_timeout_seconds=5))
+        assert result["reason"] == "call_failed"  # not no_answer after 5 s
+        assert result["hangup_reason"] == "busy"
+        assert time.monotonic() - started < 1.0
+        assert manager.slots_in_use == 0
+
+    async def test_groupcall_hangup_status_found_only_by_the_poll_is_call_failed(self, api, manager):
+        api.post("/calls").mock(return_value=ok({"groupcalls": [{"id": "g1", "call_ids": ["l1"]}]}))
+        api.get("/groupcalls/g1").mock(return_value=ok({"status": "hangup", "call_ids": ["l1"]}))
+        # The leg still looks alive: only the groupcall status ends the wait.
+        leg_routes(api, "l1")
+        ghang = api.post("/groupcalls/g1/hangup").mock(return_value=ok({}))
+        started = time.monotonic()
+        with pytest.raises(PhoneError) as excinfo:
+            await manager.call_start(
+                source_number="+1", destination_type="extension", destination_target="e",
+                language="en-US", voice_id="", max_duration_seconds=60, answer_timeout_seconds=5,
+            )
+        assert excinfo.value.reason == "call_failed"
+        assert time.monotonic() - started < 1.0
+        assert ghang.call_count == 1
+
+    async def test_phone_say_reports_call_ended(self, api, manager):
+        api.post("/speakings/sp1/say").mock(return_value=ok({}))
+        api.post("/speakings/sp1/stop").mock(return_value=ok({}))
+        answered_session(manager)
+        live = json.loads(await phone_tools.phone_say("c1", "Hello there."))
+        assert live["call_ended"] is False and live["queued"] is True
+        emit_later(manager, 0.05, call_event("c1", "hangup", hangup_reason="normal"))
+        manager.config.estimate_seconds = lambda text: 5.0
+        waited = json.loads(await asyncio.wait_for(phone_tools.phone_say("c1", "Hello again.", wait=True), 2))
+        assert waited["call_ended"] is True
+        assert waited["ended_reason"] == "normal"
+        after = json.loads(await phone_tools.phone_say("c1", "Anyone?"))
+        assert after["reason"] == "call_ended" and after["call_ended"] is True
+        await settle(manager)
+
+    async def test_shutdown_does_not_reject_a_call_answered_within_the_delay(self, api):
+        m = make_manager(shutdown_reject_delay=0.3)
+        try:
+            m.incoming_flow_ids.add("mf1")
+            answered = {"now": False}
+
+            def status(request):
+                return ok({"status": "progressing" if answered["now"] else "ringing"})
+
+            get = api.get("/calls/u9").mock(side_effect=status)
+            hang = api.post("/calls/u9/hangup").mock(return_value=ok({}))
+            api.post("/speakings/sp1/stop").mock(return_value=ok({}))
+            api.post("/calls/c1/hangup").mock(side_effect=yielding_ok(delay=0.05))
+            answered_session(m)
+            emit_later(m, 0.01, ringing("u9"))
+
+            async def answer_elsewhere():
+                await asyncio.sleep(0.1)  # another MCP process answers it
+                answered["now"] = True
+
+            other = asyncio.create_task(answer_elsewhere())
+            started = time.monotonic()
+            await m.shutdown()
+            await other
+            assert time.monotonic() - started < 1.0
+            assert get.call_count == 1 and hang.call_count == 0
+        finally:
+            await teardown_manager(m)
+
+    async def test_shutdown_rejects_a_call_still_ringing_after_the_delay(self, api):
+        m = make_manager(shutdown_reject_delay=0.2)
+        try:
+            m.incoming_flow_ids.add("mf1")
+            entered = asyncio.Event()
+            api.get("/calls/u9").mock(side_effect=yielding_ok({"status": "ringing"}, delay=0.0, entered=entered))
+            hang = api.post("/calls/u9/hangup").mock(return_value=ok({}))
+            api.post("/speakings/sp1/stop").mock(return_value=ok({}))
+            api.post("/calls/c1/hangup").mock(side_effect=yielding_ok(delay=0.05))
+            answered_session(m)
+            emit_later(m, 0.01, ringing("u9"))
+            started = time.monotonic()
+            await m.shutdown()
+            assert 0.2 <= time.monotonic() - started < 1.0
+            assert hang.call_count == 1
+        finally:
+            await teardown_manager(m)
+
+    async def test_disable_refuses_a_marker_of_another_number(self, api, manager):
+        detail = json.dumps({"voipbin_mcp": "incoming", "number_id": "n2", "previous_call_flow_id": "orig"})
+        api.get("/numbers/n1").mock(return_value=ok({"id": "n1", "call_flow_id": "mf2"}))
+        api.get("/flows/mf2").mock(return_value=ok({"id": "mf2", "detail": detail}))
+        api.get("/flows/orig").mock(return_value=ok({"id": "orig"}))
+        put = api.put("/numbers/n1/flow_ids").mock(return_value=ok({}))
+        delete = api.delete("/flows/mf2").mock(return_value=ok({}))
+        result = json.loads(await phone_tools.phone_incoming_configure("n1", False))
+        assert result["reason"] == "flow_mismatch"
+        assert put.call_count == 0 and delete.call_count == 0
+
+    async def test_a_leg_made_known_by_a_later_event_is_rescanned_at_once(self, api):
+        # poll_interval is long: only the immediate rescan can confirm l2.
+        m = make_manager(poll_interval=5.0)
+        try:
+            api.post("/calls").mock(return_value=ok({"groupcalls": [{"id": "g1", "call_ids": ["l1"]}]}))
+            api.post("/groupcalls/g1/hangup").mock(return_value=ok({}))
+            api.get("/groupcalls/g1").mock(return_value=ok({"status": "progressing", "call_ids": ["l1", "l2"]}))
+            leg_routes(api, "l1", "l2")
+
+            async def leg_events():
+                await asyncio.sleep(0.02)
+                m.on_event(call_event("l2", "progressing"))  # no groupcall_id
+                m.on_event(call_event("l2", "ringing", groupcall_id="g1"))  # late, names the group
+
+            events = asyncio.create_task(leg_events())
+            started = time.monotonic()
+            result = await m.call_start(
+                source_number="+1", destination_type="extension", destination_target="e",
+                language="en-US", voice_id="", max_duration_seconds=60, answer_timeout_seconds=1,
+            )
+            await events
+            assert result["call_id"] == "l2"
+            # Not left for the next wake-up (here the 1 s answer deadline).
+            assert time.monotonic() - started < 0.5
+        finally:
+            await teardown_manager(m)
+
+    async def test_shutdown_does_not_reject_an_unclaimed_call_answered_within_the_delay(self, api):
+        m = make_manager(shutdown_reject_delay=0.3, unclaimed_incoming_grace_seconds=60)
+        try:
+            m.incoming_flow_ids.add("mf1")
+            answered = {"now": False}
+            get = api.get("/calls/u8").mock(
+                side_effect=lambda request: ok({"status": "progressing" if answered["now"] else "ringing"})
+            )
+            hang = api.post("/calls/u8/hangup").mock(return_value=ok({}))
+            m.on_event(ringing("u8"))  # inside its grace when shutdown begins
+            assert "u8" in m.unclaimed
+
+            async def answer_elsewhere():
+                await asyncio.sleep(0.1)
+                answered["now"] = True
+
+            other = asyncio.create_task(answer_elsewhere())
+            await m.shutdown()
+            await other
+            assert get.call_count == 1 and hang.call_count == 0
+        finally:
+            await teardown_manager(m)

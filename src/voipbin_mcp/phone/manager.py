@@ -333,10 +333,11 @@ class SessionManager:
         if self._closing:
             # Shutdown already took the unclaimed list, and its drain must
             # not wait out a grace timer (longer than its whole budget): no
-            # waiter can take the call any more, so reject it now (only if
-            # it is still ringing).
+            # waiter in this process can take the call any more, so reject
+            # it after a short delay (another MCP process waiting on the same
+            # number may answer it meanwhile), only if it is still ringing.
             self._mark_handled(event.id)
-            self._spawn(self._reject_if_ringing(event.id))
+            self._spawn(self._reject_if_ringing(event.id, self.config.shutdown_reject_delay))
             return
         entry = UnclaimedCall(event)
         self.unclaimed[event.id] = entry
@@ -361,9 +362,19 @@ class SessionManager:
         except Exception as exc:
             logger.info("rejecting unclaimed call %s: %s", call_id, exc)
 
-    async def _reject_if_ringing(self, call_id: str) -> None:
+    async def _reject_if_ringing(self, call_id: str, delay: float = 0.0) -> None:
         with anyio.move_on_after(5, shield=True):
-            await self._reject_now(call_id)
+            await self._reject_after(call_id, delay)
+
+    async def _reject_after(self, call_id: str, delay: float) -> None:
+        """Wait ``delay`` (unshielded), then reject the call if still ringing.
+
+        The status is read only after the delay, so a call answered by another
+        process meanwhile is left alone.
+        """
+        if delay > 0:
+            await anyio.sleep(delay)
+        await self._reject_now(call_id)
 
     def _on_reconnect(self) -> None:
         for session in list(self.sessions.values()):
@@ -559,9 +570,16 @@ class SessionManager:
             cands = [str(c) for c in group.get("call_ids") or []]
         ended: set[str] = set()
         cursor = 0
+        # Leg events carry no groupcall_id, so an event of a leg not yet known
+        # as a candidate is skipped by the cursor; whenever the candidates
+        # grow, the whole buffer is scanned again.
+        scanned_for = len(cands)
         end = self.clock() + timeout
         next_poll = self.clock() + self.config.poll_interval
         while True:
+            if len(cands) != scanned_for:
+                scanned_for = len(cands)
+                cursor = 0
             for seq, _ts, event in list(self._call_buffer):
                 if seq <= cursor:
                     continue
@@ -575,6 +593,8 @@ class SessionManager:
                     return
                 if event.status == "hangup":
                     ended.add(event.id)
+            if len(cands) != scanned_for:
+                continue  # rescan for earlier events of the new legs
             if cands and all(c in ended for c in cands):
                 raise PhoneError("every leg of the call ended unanswered", "call_failed")
             now = self.clock()
@@ -748,6 +768,12 @@ class SessionManager:
             raise PhoneError(
                 "the number's call flow is not an MCP incoming flow (already disabled?)",
                 "not_configured",
+            )
+        if marker.get("number_id") != number_id:
+            raise PhoneError(
+                f"the number's MCP incoming flow ({current}) was created for another "
+                f"number ({marker.get('number_id')}); nothing was changed",
+                "flow_mismatch",
             )
         target = restore_call_flow_id or marker.get("previous_call_flow_id") or ""
         if is_nil(target):
@@ -1021,7 +1047,7 @@ class SessionManager:
                             self._hangup_groupcall_now, session.groupcall_id, list(session.candidate_call_ids)
                         )
                 for call_id, _entry in unclaimed:
-                    tg.start_soon(self._reject_now, call_id)
+                    tg.start_soon(self._reject_after, call_id, self.config.shutdown_reject_delay)
             # Within the same budget: let cleanup already running in the
             # background finish (speaking stops after a hangup or barge-in,
             # rejections past their grace, watchdog hangups), since the

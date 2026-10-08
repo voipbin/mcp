@@ -195,8 +195,10 @@ async def phone_wait_incoming(
     {"status": "timed_out", "timed_out": true}. For long waits call this
     repeatedly rather than with a large timeout.
 
-    While this MCP server runs, an incoming call that nobody is waiting for is
-    rejected after 15 seconds.
+    While this MCP server runs, an incoming call to a number that this server
+    process has already waited on is rejected after 15 seconds if no
+    phone_wait_incoming takes it. Calls to configured numbers this process
+    has not waited on are left ringing.
 
     When no MCP process is running, an incoming call to a configured number is never answered: it keeps ringing until the platform's one-hour call duration timeout.
 
@@ -326,8 +328,11 @@ async def phone_say(call_id: str, text: str, wait: bool = False, barge_in: bool 
     most 120 seconds; still_speaking is then true if it had not finished.
     Their speech meanwhile is buffered for the next phone_listen.
 
-    Returns {"queued", "estimated_seconds"} plus "barge_in": true when they
-    talked over you since the last result, and "still_speaking" with wait.
+    Returns {"queued", "estimated_seconds", "call_ended",
+    "events_connected"} plus "barge_in": true when they talked over you since
+    the last result, and "still_speaking" with wait. call_ended is true when
+    the call has ended (your speech then stops); a call that had already ended
+    returns {"error", "reason": "call_ended", "call_ended": true}.
 
     Args:
         call_id: The call_id from phone_call_start or phone_wait_incoming.
@@ -354,6 +359,7 @@ async def phone_say(call_id: str, text: str, wait: bool = False, barge_in: bool 
                     result["still_speaking"] = await session.wait_spoken(remaining)
                 if session.consume_barge_in():
                     result["barge_in"] = True
+                result["call_ended"] = session.ended
                 result.update(session.status_fields())
     except PhoneError as exc:
         return _error(exc)

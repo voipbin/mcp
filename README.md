@@ -149,8 +149,9 @@ then repeats `phone_say_and_listen(call_id, text)` for each turn, and ends with
 
 Incoming calls are handled only while an MCP server is running and waiting.
 Only one MCP process may wait on a given number. While the server runs, an
-incoming call that no `phone_wait_incoming` picks up within 15 seconds is
-rejected.
+incoming call to a number that this server process has already waited on is
+rejected if no `phone_wait_incoming` picks it up within 15 seconds. Calls to
+configured numbers the process has not waited on are left ringing.
 
 **Safety limits.** At most 4 concurrent calls per server process. A call is
 hung up after 5 minutes without any phone tool call, at its
@@ -203,6 +204,11 @@ key; that value is stored by the API and can appear in responses.
   speech when the other party talks over it) can be slightly early or late.
 - On a speakerphone the agent's own voice can echo back and be transcribed;
   such speech is marked `during_agent_speech`.
+- An incoming call that starts ringing while the server's event connection
+  to VoIPbin is down is not seen: it is neither answered nor rejected, and
+  the caller keeps ringing until the platform's call timeout. Call
+  `phone_wait_incoming` again once the connection is back to take later
+  calls.
 - Without a running MCP server, an incoming call to a number prepared with
   `phone_incoming_configure` keeps ringing (up to the platform's one hour call
   timeout), and the caller may hear no ringback tone.
