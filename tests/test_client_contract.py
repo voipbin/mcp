@@ -239,9 +239,10 @@ class TestStartupValidation:
         monkeypatch.setenv("VOIPBIN_AUTH_TRANSPORT", "header")
         # Stubbed so that a regression fails as a clean assertion instead of
         # starting a real stdio server inside the test process.
-        monkeypatch.setattr(
-            server.mcp, "run", lambda **kw: pytest.fail("served despite a bad transport")
-        )
+        async def refuse():
+            pytest.fail("served despite a bad transport")
+
+        monkeypatch.setattr(server.mcp, "run_stdio_async", refuse)
 
         with pytest.raises(SystemExit) as excinfo:
             server.main()
@@ -256,14 +257,19 @@ class TestStartupValidation:
 
         started = []
         monkeypatch.setenv("VOIPBIN_API_KEY", "k")
-        monkeypatch.setattr(server.mcp, "run", lambda **kw: started.append(kw))
+
+        # main() serves stdio through anyio.run(_serve) so that the phone
+        # shutdown cleanup runs on the same loop; stub the stdio server itself.
+        async def serve():
+            started.append("stdio")
+
+        monkeypatch.setattr(server.mcp, "run_stdio_async", serve)
 
         for value in ("cookie", "query", "COOKIE", " query "):
             monkeypatch.setenv("VOIPBIN_AUTH_TRANSPORT", value)
             server.main()
 
-        assert len(started) == 4
-        assert all(kw == {"transport": "stdio"} for kw in started)
+        assert started == ["stdio"] * 4
 
     def test_unset_transport_reaches_the_server(self, monkeypatch):
         import voipbin_mcp.server as server
@@ -271,7 +277,11 @@ class TestStartupValidation:
         started = []
         monkeypatch.setenv("VOIPBIN_API_KEY", "k")
         monkeypatch.delenv("VOIPBIN_AUTH_TRANSPORT", raising=False)
-        monkeypatch.setattr(server.mcp, "run", lambda **kw: started.append(kw))
+
+        async def serve():
+            started.append("stdio")
+
+        monkeypatch.setattr(server.mcp, "run_stdio_async", serve)
 
         server.main()
-        assert started == [{"transport": "stdio"}]
+        assert started == ["stdio"]

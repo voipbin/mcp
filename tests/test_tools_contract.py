@@ -149,6 +149,22 @@ PINNED_CLAIMS: tuple[tuple[str, str, str], ...] = (
         "answers 403 PERMISSION_DENIED unless your key carries project "
         "superadmin permission.",
     ),
+    (
+        "phone.phone_call_start",
+        "bin-call-manager/pkg/callhandler/start.go:289 (outgoing), :239 "
+        "(incoming); callhandler/main.go:177 (defaultTimeoutCallDuration 1h)",
+        "The platform hangs up every call one hour after its channel is "
+        "created, so a conversation can never run longer than that; this is "
+        "why max_duration_seconds is capped at 3600.",
+    ),
+    (
+        "phone.phone_wait_incoming",
+        "bin-call-manager/pkg/callhandler/start.go:239 (delayed hangup set on "
+        "incoming channel creation); callhandler/main.go:177",
+        "When no MCP process is running, an incoming call to a configured "
+        "number is never answered: it keeps ringing until the platform's "
+        "one-hour call duration timeout.",
+    ),
 )
 
 
@@ -1241,6 +1257,8 @@ class TestGoldenDocstrings:
             "emails.send_email": 1,
             "flows.create_flow": 1,
             "routes.list_routes": 1,
+            "phone.phone_call_start": 1,
+            "phone.phone_wait_incoming": 1,
         }
         actual: dict[str, int] = {}
         for accessor, _ref, _claim in PINNED_CLAIMS:
@@ -1262,6 +1280,7 @@ class TestGoldenDocstrings:
         known_services = {
             "bin-ai-manager",
             "bin-api-manager",
+            "bin-call-manager",
             "bin-campaign-manager",
             "bin-common-handler",
             "bin-conference-manager",
