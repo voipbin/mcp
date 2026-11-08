@@ -128,3 +128,78 @@ class TestHangupCall:
         parsed = json.loads(result)
         assert parsed["status"] == "hangup"
         assert route.called
+
+
+class TestSendMessage:
+    """source_number is optional; omitting it omits the whole source key."""
+
+    URL = "https://api.voipbin.net/v1.0/messages"
+
+    @staticmethod
+    def _body(route):
+        return json.loads(route.calls[0].request.content)
+
+    @respx.mock
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blank", [None, "", "   ", "\t\n"])
+    async def test_blank_source_omits_the_source_key(self, blank):
+        route = respx.post(self.URL).mock(
+            return_value=httpx.Response(200, json={"id": "m-1"})
+        )
+        from voipbin_mcp.tools.messages import send_message
+
+        await send_message("+1555****0002", "hi", source_number=blank)
+        assert self._body(route) == {
+            "destinations": [{"type": "tel", "target": "+1555****0002"}],
+            "text": "hi",
+        }
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_omitted_source_omits_the_source_key(self):
+        route = respx.post(self.URL).mock(
+            return_value=httpx.Response(200, json={"id": "m-1"})
+        )
+        from voipbin_mcp.tools.messages import send_message
+
+        await send_message("+1555****0002", "hi")
+        assert self._body(route) == {
+            "destinations": [{"type": "tel", "target": "+1555****0002"}],
+            "text": "hi",
+        }
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_given_source_is_sent_as_before(self):
+        route = respx.post(self.URL).mock(
+            return_value=httpx.Response(200, json={"id": "m-1"})
+        )
+        from voipbin_mcp.tools.messages import send_message
+
+        await send_message("+1555****0002", "hi", "+1555****0001")
+        assert self._body(route) == {
+            "source": {"type": "tel", "target": "+1555****0001"},
+            "destinations": [{"type": "tel", "target": "+1555****0002"}],
+            "text": "hi",
+        }
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_given_source_is_not_trimmed(self):
+        route = respx.post(self.URL).mock(
+            return_value=httpx.Response(200, json={"id": "m-1"})
+        )
+        from voipbin_mcp.tools.messages import send_message
+
+        await send_message("+1555****0002", "hi", source_number=" +1555****0001 ")
+        assert self._body(route)["source"] == {
+            "type": "tel",
+            "target": " +1555****0001 ",
+        }
+
+    @pytest.mark.asyncio
+    async def test_schema_does_not_require_source_number(self):
+        tools = {t.name: t for t in await voipbin_mcp.server.mcp.list_tools()}
+        schema = tools["send_message"].inputSchema
+        assert schema["required"] == ["destination_number", "text"]
+        assert "source_number" in schema["properties"]

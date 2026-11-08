@@ -33,21 +33,42 @@ async def get_message(message_id: str) -> str:
 
 @mcp.tool()
 async def send_message(
-    source_number: str,
     destination_number: str,
     text: str,
+    source_number: str | None = None,
 ) -> str:
     """Send an SMS message.
 
+    The sender number is optional. Omit source_number to send from the
+    default sender number configured for your account. If the account has no
+    default sender number, the API rejects the request with SOURCE_REQUIRED
+    (400). A source_number that is empty or only whitespace counts as omitted.
+
+    A source_number that is given is sent exactly as written, without
+    trimming, and must be a normal, active phone number that belongs to your
+    account, in E.164 format. Otherwise the API rejects the request:
+    SOURCE_INVALID (400) for a malformed number, SOURCE_NOT_OWNED (403) for a
+    number that is not an active, normal number of your account,
+    SOURCE_LOOKUP_FAILED (500) when the number could not be verified. A default sender number that is no longer a normal,
+    active number of your account is rejected with DEFAULT_SOURCE_INVALID
+    (409).
+
+    Argument order: destination_number and text come first, and
+    source_number is last. Positional calls written for the earlier order
+    (source_number, destination_number, text) now send to the wrong numbers,
+    so pass source_number by name.
+
     Args:
-        source_number: Your VoIPbin phone number in E.164 format (e.g., "+14155551234").
         destination_number: Recipient phone number in E.164 format.
         text: The message text to send.
+        source_number: Optional sender phone number in E.164 format (e.g., "+141****1234"). Omit it to use the account's default sender number.
     """
     client = get_client()
-    result = await client.post("/messages", json={
-        "source": {"type": "tel", "target": source_number},
+    body: dict = {
         "destinations": [{"type": "tel", "target": destination_number}],
         "text": text,
-    })
+    }
+    if source_number is not None and source_number.strip():
+        body["source"] = {"type": "tel", "target": source_number}
+    result = await client.post("/messages", json=body)
     return format_response(result)
